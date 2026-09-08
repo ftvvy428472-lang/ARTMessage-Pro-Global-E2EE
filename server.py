@@ -35,7 +35,7 @@ logger = logging.getLogger(__name__)
 # ===========================================
 # КОНФИГУРАЦИЯ
 # ===========================================
-SECRET_KEY = "your-secret-key-change-in-production"  # В продакшене менять!
+SECRET_KEY = os.getenv("SECRET_KEY", "your-secret-key-change-in-production")
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24 * 7  # 7 дней
 REFRESH_TOKEN_EXPIRE_DAYS = 30
@@ -52,13 +52,19 @@ TEMP_DIR.mkdir(exist_ok=True)
 AVATAR_DIR.mkdir(exist_ok=True)
 
 # ===========================================
-# БАЗА ДАННЫХ
+# БАЗА ДАННЫХ (PostgreSQL на Render)
 # ===========================================
-SQLALCHEMY_DATABASE_URL = "sqlite:///./artmessage.db"
+DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./artmessage.db")
+# Render использует postgres://, но SQLAlchemy нужен postgresql://
+if DATABASE_URL and DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+SQLALCHEMY_DATABASE_URL = DATABASE_URL
+
 engine = create_engine(
-    SQLALCHEMY_DATABASE_URL, 
-    connect_args={"check_same_thread": False},
-    pool_pre_ping=True
+    SQLALCHEMY_DATABASE_URL,
+    pool_pre_ping=True,
+    pool_size=10,
+    max_overflow=20
 )
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
@@ -83,7 +89,6 @@ class User(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
     
-    # Отношения
     messages = relationship("Message", foreign_keys="Message.sender_id", back_populates="sender")
     chats_created = relationship("Chat", foreign_keys="Chat.created_by", back_populates="creator")
     memberships = relationship("ChatMember", back_populates="user")
@@ -94,14 +99,13 @@ class Chat(Base):
     __tablename__ = "chats"
     
     id = Column(Integer, primary_key=True, index=True)
-    type = Column(String(20), nullable=False)  # 'private', 'group', 'channel'
+    type = Column(String(20), nullable=False)
     name = Column(String(100), nullable=True)
     description = Column(String(500), nullable=True)
     avatar_url = Column(String(500), nullable=True)
     created_by = Column(Integer, ForeignKey("users.id"), nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow)
     
-    # Отношения
     creator = relationship("User", foreign_keys=[created_by], back_populates="chats_created")
     members = relationship("ChatMember", back_populates="chat")
     messages = relationship("Message", back_populates="chat")
@@ -112,12 +116,11 @@ class ChatMember(Base):
     id = Column(Integer, primary_key=True, index=True)
     chat_id = Column(Integer, ForeignKey("chats.id"), nullable=False)
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
-    role = Column(String(20), default='member')  # 'admin', 'member', 'creator'
+    role = Column(String(20), default='member')
     is_pinned = Column(Boolean, default=False)
     folder = Column(String(50), nullable=True)
     joined_at = Column(DateTime, default=datetime.utcnow)
     
-    # Отношения
     chat = relationship("Chat", back_populates="members")
     user = relationship("User", back_populates="memberships")
     
@@ -129,20 +132,19 @@ class Message(Base):
     __tablename__ = "messages"
     
     id = Column(Integer, primary_key=True, index=True)
-    message_id = Column(String(36), unique=True, index=True, nullable=False)  # UUID
-    send_id = Column(String(36), nullable=False)  # UUID для пары отправитель-получатель
+    message_id = Column(String(36), unique=True, index=True, nullable=False)
+    send_id = Column(String(36), nullable=False)
     chat_id = Column(Integer, ForeignKey("chats.id"), nullable=False)
     sender_id = Column(Integer, ForeignKey("users.id"), nullable=False)
-    content = Column(Text, nullable=False)  # Зашифрованный текст
+    content = Column(Text, nullable=False)
     file_url = Column(String(500), nullable=True)
-    file_type = Column(String(20), nullable=True)  # 'image', 'document'
+    file_type = Column(String(20), nullable=True)
     file_name = Column(String(255), nullable=True)
     is_read = Column(Boolean, default=False)
     read_at = Column(DateTime, nullable=True)
     delivered_at = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     
-    # Отношения
     chat = relationship("Chat", back_populates="messages")
     sender = relationship("User", foreign_keys=[sender_id], back_populates="messages")
 
@@ -154,7 +156,6 @@ class UserBlock(Base):
     blocked_id = Column(Integer, ForeignKey("users.id"), nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow)
     
-    # Отношения
     blocker = relationship("User", foreign_keys=[blocker_id], back_populates="blocks_given")
     blocked = relationship("User", foreign_keys=[blocked_id], back_populates="blocks_received")
     
@@ -163,7 +164,7 @@ class UserBlock(Base):
     )
 
 # ===========================================
-# PYDANTIC МОДЕЛИ (Валидация данных)
+# PYDANTIC МОДЕЛИ
 # ===========================================
 class UserRegister(BaseModel):
     username: str = Field(..., min_length=3, max_length=50)
@@ -199,11 +200,7 @@ class ChatCreate(BaseModel):
     type: str = Field(..., regex='^(private|group|channel)$')
     name: Optional[str] = Field(None, min_length=1, max_length=100)
     description: Optional[str] = Field(None, max_length=500)
-    user_ids: Optional[List[int]] = []  # Для добавления участников при создании
-
-class ChatUpdate(BaseModel):
-    name: Optional[str] = Field(None, min_length=1, max_length=100)
-    description: Optional[str] = Field(None, max_length=500)
+    user_ids: Optional[List[int]] = []
 
 class MessageCreate(BaseModel):
     content: str = Field(..., min_length=1)
@@ -221,14 +218,10 @@ class Token(BaseModel):
     refresh_token: str
     token_type: str = "bearer"
 
-class TokenData(BaseModel):
-    user_id: Optional[int] = None
-
 # ===========================================
 # ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
 # ===========================================
 def get_db():
-    """Получение сессии БД"""
     db = SessionLocal()
     try:
         yield db
@@ -236,23 +229,19 @@ def get_db():
         db.close()
 
 def hash_password(password: str) -> str:
-    """Хеширование пароля bcrypt"""
     salt = bcrypt.gensalt(rounds=12)
     return bcrypt.hashpw(password.encode('utf-8'), salt).decode('utf-8')
 
 def verify_password(password: str, password_hash: str) -> bool:
-    """Проверка пароля"""
     return bcrypt.checkpw(password.encode('utf-8'), password_hash.encode('utf-8'))
 
 def create_jwt_token(data: dict, expires_delta: timedelta) -> str:
-    """Создание JWT токена"""
     to_encode = data.copy()
     expire = datetime.utcnow() + expires_delta
     to_encode.update({"exp": expire})
     return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
 
 def decode_jwt_token(token: str) -> dict:
-    """Декодирование JWT токена"""
     try:
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
         return payload
@@ -260,7 +249,6 @@ def decode_jwt_token(token: str) -> dict:
         return {}
 
 def get_current_user(token: str, db: Session) -> User:
-    """Получение текущего пользователя из JWT"""
     payload = decode_jwt_token(token)
     user_id = payload.get("user_id")
     if not user_id:
@@ -273,13 +261,10 @@ def get_current_user(token: str, db: Session) -> User:
     return user
 
 def generate_filename(original_filename: str) -> str:
-    """Генерация уникального имени файла"""
     ext = Path(original_filename).suffix
     return f"{uuid.uuid4().hex}{ext}"
 
 def save_file(file: UploadFile, directory: Path, max_size: int = MAX_FILE_SIZE) -> str:
-    """Сохранение файла с проверкой размера"""
-    # Проверка размера
     file.file.seek(0, 2)
     size = file.file.tell()
     file.file.seek(0)
@@ -287,7 +272,6 @@ def save_file(file: UploadFile, directory: Path, max_size: int = MAX_FILE_SIZE) 
     if size > max_size:
         raise HTTPException(400, f"File too large. Max size: {max_size} bytes")
     
-    # Генерация имени и сохранение
     filename = generate_filename(file.filename)
     filepath = directory / filename
     
@@ -297,7 +281,6 @@ def save_file(file: UploadFile, directory: Path, max_size: int = MAX_FILE_SIZE) 
     return str(filepath.relative_to("."))
 
 def delete_old_temp_files():
-    """Удаление старых временных файлов"""
     try:
         now = datetime.utcnow()
         for filepath in TEMP_DIR.iterdir():
@@ -310,7 +293,7 @@ def delete_old_temp_files():
         logger.error(f"Error deleting temp files: {e}")
 
 # ===========================================
-# СОЗДАНИЕ ТАБЛИЦ ПРИ СТАРТЕ
+# СОЗДАНИЕ ТАБЛИЦ
 # ===========================================
 Base.metadata.create_all(bind=engine)
 logger.info("Database tables created successfully")
@@ -320,17 +303,16 @@ logger.info("Database tables created successfully")
 # ===========================================
 app = FastAPI(title="ARTMessage API", version="1.0.0")
 
-# CORS настройки
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # В продакшене заменить на конкретные домены
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 # ===========================================
-# ШЕДУЛЕР (Фоновые задачи)
+# ШЕДУЛЕР
 # ===========================================
 scheduler = BackgroundScheduler()
 scheduler.add_job(
@@ -343,23 +325,17 @@ scheduler.start()
 logger.info("Background scheduler started")
 
 # ===========================================
-# АУТЕНТИФИКАЦИЯ ЭНДПОИНТЫ
+# АУТЕНТИФИКАЦИЯ
 # ===========================================
-@app.post("/auth/register", response_model=dict)
+@app.post("/auth/register")
 async def register(user_data: UserRegister, db: Session = Depends(get_db)):
-    """
-    Регистрация нового пользователя
-    """
     try:
-        # Проверка уникальности username
         if db.query(User).filter(User.username == user_data.username).first():
             raise HTTPException(400, "Username already taken")
         
-        # Проверка уникальности hardware_id
         if db.query(User).filter(User.hardware_id == user_data.hardware_id).first():
             raise HTTPException(400, "Hardware ID already registered")
         
-        # Создание пользователя
         hashed_password = hash_password(user_data.password)
         new_user = User(
             username=user_data.username,
@@ -393,9 +369,6 @@ async def register(user_data: UserRegister, db: Session = Depends(get_db)):
 
 @app.post("/auth/login", response_model=Token)
 async def login(user_data: UserLogin, db: Session = Depends(get_db)):
-    """
-    Вход пользователя
-    """
     try:
         user = db.query(User).filter(User.username == user_data.username).first()
         if not user:
@@ -404,11 +377,9 @@ async def login(user_data: UserLogin, db: Session = Depends(get_db)):
         if not verify_password(user_data.password, user.password_hash):
             raise HTTPException(401, "Invalid username or password")
         
-        # Проверка hardware_id
         if user.hardware_id != user_data.hardware_id:
             raise HTTPException(401, "Invalid hardware ID")
         
-        # Создание токенов
         access_token = create_jwt_token(
             {"user_id": user.id},
             timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
@@ -434,9 +405,6 @@ async def login(user_data: UserLogin, db: Session = Depends(get_db)):
 
 @app.post("/auth/refresh", response_model=Token)
 async def refresh_token(refresh_token: str = Form(...), db: Session = Depends(get_db)):
-    """
-    Обновление токена доступа
-    """
     try:
         payload = decode_jwt_token(refresh_token)
         user_id = payload.get("user_id")
@@ -456,8 +424,6 @@ async def refresh_token(refresh_token: str = Form(...), db: Session = Depends(ge
             timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS)
         )
         
-        logger.info(f"Token refreshed for user: {user.username}")
-        
         return {
             "access_token": new_access_token,
             "refresh_token": new_refresh_token,
@@ -472,9 +438,6 @@ async def refresh_token(refresh_token: str = Form(...), db: Session = Depends(ge
 
 @app.post("/auth/logout")
 async def logout(token: str = Form(...), db: Session = Depends(get_db)):
-    """
-    Выход пользователя
-    """
     try:
         user = get_current_user(token, db)
         logger.info(f"User logged out: {user.username} (ID: {user.id})")
@@ -487,13 +450,10 @@ async def logout(token: str = Form(...), db: Session = Depends(get_db)):
         raise HTTPException(500, f"Logout failed: {str(e)}")
 
 # ===========================================
-# ПРОФИЛЬ ЭНДПОИНТЫ
+# ПРОФИЛЬ
 # ===========================================
 @app.get("/user/me")
 async def get_my_profile(token: str = Form(...), db: Session = Depends(get_db)):
-    """
-    Получение своего профиля
-    """
     try:
         user = get_current_user(token, db)
         return {
@@ -522,13 +482,9 @@ async def update_my_profile(
     update_data: UserUpdate = Depends(),
     db: Session = Depends(get_db)
 ):
-    """
-    Обновление профиля
-    """
     try:
         user = get_current_user(token, db)
         
-        # Проверка уникальности username
         if update_data.username and update_data.username != user.username:
             existing = db.query(User).filter(User.username == update_data.username).first()
             if existing:
@@ -562,9 +518,6 @@ async def change_password(
     password_data: PasswordChange = Depends(),
     db: Session = Depends(get_db)
 ):
-    """
-    Смена пароля
-    """
     try:
         user = get_current_user(token, db)
         
@@ -591,23 +544,17 @@ async def upload_avatar(
     avatar: UploadFile = File(...),
     db: Session = Depends(get_db)
 ):
-    """
-    Загрузка/обновление аватарки
-    """
     try:
         user = get_current_user(token, db)
         
-        # Проверка типа файла
         if not avatar.content_type.startswith('image/'):
             raise HTTPException(400, "Only images are allowed for avatar")
         
-        # Сохранение файла
         filename = generate_filename(avatar.filename)
         filepath = AVATAR_DIR / filename
         with open(filepath, "wb") as f:
             shutil.copyfileobj(avatar.file, f)
         
-        # Удаление старой аватарки
         if user.avatar_url:
             old_path = Path(user.avatar_url)
             if old_path.exists() and old_path.parent == AVATAR_DIR:
@@ -633,9 +580,6 @@ async def search_users(
     token: str = Form(...),
     db: Session = Depends(get_db)
 ):
-    """
-    Поиск пользователей по username (автодополнение)
-    """
     try:
         current_user = get_current_user(token, db)
         
@@ -660,7 +604,7 @@ async def search_users(
         raise HTTPException(500, f"Search failed: {str(e)}")
 
 # ===========================================
-# ЧАТЫ ЭНДПОИНТЫ
+# ЧАТЫ
 # ===========================================
 @app.post("/chats")
 async def create_chat(
@@ -668,17 +612,12 @@ async def create_chat(
     chat_data: ChatCreate = Depends(),
     db: Session = Depends(get_db)
 ):
-    """
-    Создание чата (private, group, channel)
-    """
     try:
         current_user = get_current_user(token, db)
         
-        # Для private чата проверяем, что указан один пользователь
         if chat_data.type == 'private' and len(chat_data.user_ids) != 1:
             raise HTTPException(400, "Private chat must have exactly one other user")
         
-        # Создание чата
         new_chat = Chat(
             type=chat_data.type,
             name=chat_data.name,
@@ -687,9 +626,8 @@ async def create_chat(
             created_at=datetime.utcnow()
         )
         db.add(new_chat)
-        db.flush()  # Получаем ID
+        db.flush()
         
-        # Добавление создателя как администратора
         creator_member = ChatMember(
             chat_id=new_chat.id,
             user_id=current_user.id,
@@ -698,14 +636,11 @@ async def create_chat(
         )
         db.add(creator_member)
         
-        # Добавление участников
         for user_id in chat_data.user_ids:
-            # Проверка, что пользователь существует
             user = db.query(User).filter(User.id == user_id).first()
             if not user:
                 raise HTTPException(400, f"User with ID {user_id} not found")
             
-            # Проверка, что не добавляем себя
             if user_id == current_user.id:
                 continue
             
@@ -743,13 +678,9 @@ async def get_chats(
     offset: int = Query(0, ge=0),
     db: Session = Depends(get_db)
 ):
-    """
-    Получение списка чатов пользователя с пагинацией
-    """
     try:
         current_user = get_current_user(token, db)
         
-        # Получение чатов, где пользователь является участником
         member_chats = db.query(ChatMember).filter(
             ChatMember.user_id == current_user.id
         ).order_by(ChatMember.is_pinned.desc(), ChatMember.joined_at.desc()).offset(offset).limit(limit).all()
@@ -760,7 +691,6 @@ async def get_chats(
             if not chat:
                 continue
             
-            # Получение последнего сообщения
             last_message = db.query(Message).filter(
                 Message.chat_id == chat.id
             ).order_by(Message.created_at.desc()).first()
@@ -801,13 +731,9 @@ async def get_chat_details(
     token: str = Form(...),
     db: Session = Depends(get_db)
 ):
-    """
-    Получение деталей чата
-    """
     try:
         current_user = get_current_user(token, db)
         
-        # Проверка, что пользователь является участником чата
         member = db.query(ChatMember).filter(
             ChatMember.chat_id == chat_id,
             ChatMember.user_id == current_user.id
@@ -820,7 +746,6 @@ async def get_chat_details(
         if not chat:
             raise HTTPException(404, "Chat not found")
         
-        # Получение участников
         members = db.query(ChatMember, User).join(
             User, ChatMember.user_id == User.id
         ).filter(ChatMember.chat_id == chat_id).all()
@@ -857,9 +782,6 @@ async def delete_chat(
     token: str = Form(...),
     db: Session = Depends(get_db)
 ):
-    """
-    Удаление чата (только создатель или админ)
-    """
     try:
         current_user = get_current_user(token, db)
         
@@ -867,7 +789,6 @@ async def delete_chat(
         if not chat:
             raise HTTPException(404, "Chat not found")
         
-        # Проверка прав
         member = db.query(ChatMember).filter(
             ChatMember.chat_id == chat_id,
             ChatMember.user_id == current_user.id
@@ -876,13 +797,8 @@ async def delete_chat(
         if not member or (member.role not in ['creator', 'admin']):
             raise HTTPException(403, "Only creator or admin can delete this chat")
         
-        # Удаление всех сообщений
         db.query(Message).filter(Message.chat_id == chat_id).delete()
-        
-        # Удаление всех участников
         db.query(ChatMember).filter(ChatMember.chat_id == chat_id).delete()
-        
-        # Удаление чата
         db.delete(chat)
         db.commit()
         
@@ -902,9 +818,6 @@ async def toggle_pin_chat(
     token: str = Form(...),
     db: Session = Depends(get_db)
 ):
-    """
-    Закрепить/открепить чат
-    """
     try:
         current_user = get_current_user(token, db)
         
@@ -936,9 +849,6 @@ async def move_chat_to_folder(
     token: str = Form(...),
     db: Session = Depends(get_db)
 ):
-    """
-    Перемещение чата в папку
-    """
     try:
         current_user = get_current_user(token, db)
         
@@ -970,9 +880,6 @@ async def add_chat_member(
     member_data: MemberAdd = Depends(),
     db: Session = Depends(get_db)
 ):
-    """
-    Добавление участника в чат
-    """
     try:
         current_user = get_current_user(token, db)
         
@@ -980,7 +887,6 @@ async def add_chat_member(
         if not chat:
             raise HTTPException(404, "Chat not found")
         
-        # Проверка прав (админ или создатель)
         admin_member = db.query(ChatMember).filter(
             ChatMember.chat_id == chat_id,
             ChatMember.user_id == current_user.id,
@@ -990,7 +896,6 @@ async def add_chat_member(
         if not admin_member:
             raise HTTPException(403, "Only admin or creator can add members")
         
-        # Проверка, что пользователь не заблокирован
         blocked = db.query(UserBlock).filter(
             (UserBlock.blocker_id == member_data.user_id) & (UserBlock.blocked_id == current_user.id) |
             (UserBlock.blocker_id == current_user.id) & (UserBlock.blocked_id == member_data.user_id)
@@ -999,7 +904,6 @@ async def add_chat_member(
         if blocked:
             raise HTTPException(403, "Cannot add blocked user")
         
-        # Проверка, что пользователь уже не участник
         existing = db.query(ChatMember).filter(
             ChatMember.chat_id == chat_id,
             ChatMember.user_id == member_data.user_id
@@ -1008,7 +912,6 @@ async def add_chat_member(
         if existing:
             raise HTTPException(400, "User is already a member of this chat")
         
-        # Проверка, что пользователь существует
         user = db.query(User).filter(User.id == member_data.user_id).first()
         if not user:
             raise HTTPException(404, "User not found")
@@ -1039,9 +942,6 @@ async def remove_chat_member(
     token: str = Form(...),
     db: Session = Depends(get_db)
 ):
-    """
-    Удаление участника из чата
-    """
     try:
         current_user = get_current_user(token, db)
         
@@ -1049,7 +949,6 @@ async def remove_chat_member(
         if not chat:
             raise HTTPException(404, "Chat not found")
         
-        # Проверка прав
         admin_member = db.query(ChatMember).filter(
             ChatMember.chat_id == chat_id,
             ChatMember.user_id == current_user.id,
@@ -1059,7 +958,6 @@ async def remove_chat_member(
         if not admin_member:
             raise HTTPException(403, "Only admin or creator can remove members")
         
-        # Нельзя удалить создателя
         target_member = db.query(ChatMember).filter(
             ChatMember.chat_id == chat_id,
             ChatMember.user_id == user_id
@@ -1092,13 +990,9 @@ async def update_member_role(
     role_data: MemberRoleUpdate = Depends(),
     db: Session = Depends(get_db)
 ):
-    """
-    Изменение роли участника
-    """
     try:
         current_user = get_current_user(token, db)
         
-        # Проверка прав (только создатель может назначать админов)
         creator_member = db.query(ChatMember).filter(
             ChatMember.chat_id == chat_id,
             ChatMember.user_id == current_user.id,
@@ -1133,23 +1027,19 @@ async def update_member_role(
         raise HTTPException(500, f"Failed to update role: {str(e)}")
 
 # ===========================================
-# СООБЩЕНИЯ ЭНДПОИНТЫ
+# СООБЩЕНИЯ
 # ===========================================
 @app.get("/chats/{chat_id}/messages")
 async def get_chat_messages(
     chat_id: int,
     token: str = Form(...),
     limit: int = Query(20, ge=1, le=100),
-    before: Optional[str] = None,  # ISO формат времени для пагинации
+    before: Optional[str] = None,
     db: Session = Depends(get_db)
 ):
-    """
-    Получение истории сообщений чата
-    """
     try:
         current_user = get_current_user(token, db)
         
-        # Проверка, что пользователь участник чата
         member = db.query(ChatMember).filter(
             ChatMember.chat_id == chat_id,
             ChatMember.user_id == current_user.id
@@ -1158,7 +1048,6 @@ async def get_chat_messages(
         if not member:
             raise HTTPException(403, "You are not a member of this chat")
         
-        # Проверка блокировки
         blocked = db.query(UserBlock).filter(
             (UserBlock.blocker_id == current_user.id) | (UserBlock.blocked_id == current_user.id)
         ).all()
@@ -1201,13 +1090,9 @@ async def send_message(
     message_data: MessageCreate = Depends(),
     db: Session = Depends(get_db)
 ):
-    """
-    Отправка сообщения
-    """
     try:
         current_user = get_current_user(token, db)
         
-        # Проверка, что пользователь участник чата
         member = db.query(ChatMember).filter(
             ChatMember.chat_id == chat_id,
             ChatMember.user_id == current_user.id
@@ -1216,7 +1101,6 @@ async def send_message(
         if not member:
             raise HTTPException(403, "You are not a member of this chat")
         
-        # Проверка блокировки
         blocked = db.query(UserBlock).filter(
             (UserBlock.blocker_id == current_user.id) | (UserBlock.blocked_id == current_user.id)
         ).first()
@@ -1224,7 +1108,6 @@ async def send_message(
         if blocked:
             raise HTTPException(403, "You are blocked or you blocked this user")
         
-        # Проверка уникальности message_id
         existing = db.query(Message).filter(
             Message.message_id == message_data.message_id
         ).first()
@@ -1232,7 +1115,6 @@ async def send_message(
         if existing:
             raise HTTPException(400, "Message ID already exists")
         
-        # Создание сообщения
         new_message = Message(
             message_id=message_data.message_id,
             send_id=message_data.send_id,
@@ -1267,9 +1149,6 @@ async def mark_message_read(
     token: str = Form(...),
     db: Session = Depends(get_db)
 ):
-    """
-    Отметка сообщения как прочитанного
-    """
     try:
         current_user = get_current_user(token, db)
         
@@ -1277,12 +1156,10 @@ async def mark_message_read(
         if not message:
             raise HTTPException(404, "Message not found")
         
-        # Проверка, что пользователь является получателем
         chat = db.query(Chat).filter(Chat.id == message.chat_id).first()
         if not chat:
             raise HTTPException(404, "Chat not found")
         
-        # Проверка, что пользователь участник чата
         member = db.query(ChatMember).filter(
             ChatMember.chat_id == message.chat_id,
             ChatMember.user_id == current_user.id
@@ -1313,13 +1190,9 @@ async def get_unread_count(
     token: str = Form(...),
     db: Session = Depends(get_db)
 ):
-    """
-    Получение количества непрочитанных сообщений
-    """
     try:
         current_user = get_current_user(token, db)
         
-        # Получение всех чатов пользователя
         member_chats = db.query(ChatMember).filter(
             ChatMember.user_id == current_user.id
         ).all()
@@ -1341,7 +1214,7 @@ async def get_unread_count(
         raise HTTPException(500, f"Failed to get unread count: {str(e)}")
 
 # ===========================================
-# ФАЙЛЫ ЭНДПОИНТЫ
+# ФАЙЛЫ
 # ===========================================
 @app.post("/upload/temp")
 async def upload_temp_file(
@@ -1349,18 +1222,13 @@ async def upload_temp_file(
     file: UploadFile = File(...),
     db: Session = Depends(get_db)
 ):
-    """
-    Загрузка временного файла
-    """
     try:
         current_user = get_current_user(token, db)
         
-        # Проверка типа файла
         file_type = 'image' if file.content_type.startswith('image/') else 'document'
         if file_type not in ALLOWED_FILE_TYPES:
             raise HTTPException(400, "Only images and documents are allowed")
         
-        # Сохранение файла
         filepath = save_file(file, TEMP_DIR)
         
         logger.info(f"Temporary file uploaded: {filepath} by {current_user.username}")
@@ -1384,25 +1252,18 @@ async def download_file(
     token: str = Form(...),
     db: Session = Depends(get_db)
 ):
-    """
-    Скачивание файла с проверкой прав доступа
-    """
     try:
         current_user = get_current_user(token, db)
         
-        # Проверка, что файл существует
         file_path = Path("uploads") / file_id
         if not file_path.exists():
             raise HTTPException(404, "File not found")
         
-        # Проверка прав доступа (только участники чата могут скачивать файлы)
-        # Находим сообщение с этим файлом
         message = db.query(Message).filter(
             Message.file_url == str(file_path)
         ).first()
         
         if message:
-            # Проверка, что пользователь участник чата
             member = db.query(ChatMember).filter(
                 ChatMember.chat_id == message.chat_id,
                 ChatMember.user_id == current_user.id
@@ -1420,7 +1281,7 @@ async def download_file(
         raise HTTPException(500, f"Failed to download file: {str(e)}")
 
 # ===========================================
-# БЛОКИРОВКИ ЭНДПОИНТЫ
+# БЛОКИРОВКИ
 # ===========================================
 @app.post("/blocks/{user_id}")
 async def block_user(
@@ -1428,21 +1289,16 @@ async def block_user(
     token: str = Form(...),
     db: Session = Depends(get_db)
 ):
-    """
-    Блокировка пользователя
-    """
     try:
         current_user = get_current_user(token, db)
         
         if user_id == current_user.id:
             raise HTTPException(400, "Cannot block yourself")
         
-        # Проверка, что пользователь существует
         user = db.query(User).filter(User.id == user_id).first()
         if not user:
             raise HTTPException(404, "User not found")
         
-        # Проверка, что пользователь не заблокирован
         existing = db.query(UserBlock).filter(
             UserBlock.blocker_id == current_user.id,
             UserBlock.blocked_id == user_id
@@ -1475,9 +1331,6 @@ async def unblock_user(
     token: str = Form(...),
     db: Session = Depends(get_db)
 ):
-    """
-    Разблокировка пользователя
-    """
     try:
         current_user = get_current_user(token, db)
         
@@ -1507,9 +1360,6 @@ async def get_blocked_users(
     token: str = Form(...),
     db: Session = Depends(get_db)
 ):
-    """
-    Получение списка заблокированных пользователей
-    """
     try:
         current_user = get_current_user(token, db)
         
@@ -1533,7 +1383,7 @@ async def get_blocked_users(
         raise HTTPException(500, f"Failed to get blocked users: {str(e)}")
 
 # ===========================================
-# КАНАЛЫ ЭНДПОИНТЫ
+# КАНАЛЫ
 # ===========================================
 @app.get("/channels")
 async def get_public_channels(
@@ -1542,9 +1392,6 @@ async def get_public_channels(
     offset: int = Query(0, ge=0),
     db: Session = Depends(get_db)
 ):
-    """
-    Получение списка публичных каналов
-    """
     try:
         current_user = get_current_user(token, db)
         
@@ -1554,7 +1401,6 @@ async def get_public_channels(
         
         result = []
         for channel in channels:
-            # Проверка, подписан ли пользователь
             is_subscribed = db.query(ChatMember).filter(
                 ChatMember.chat_id == channel.id,
                 ChatMember.user_id == current_user.id
@@ -1589,9 +1435,6 @@ async def toggle_channel_subscription(
     token: str = Form(...),
     db: Session = Depends(get_db)
 ):
-    """
-    Подписка/отписка от канала
-    """
     try:
         current_user = get_current_user(token, db)
         
@@ -1609,13 +1452,11 @@ async def toggle_channel_subscription(
         ).first()
         
         if member:
-            # Отписка
             db.delete(member)
             db.commit()
             logger.info(f"User {current_user.username} unsubscribed from channel {chat_id}")
             return {"message": "Unsubscribed from channel"}
         else:
-            # Подписка
             new_member = ChatMember(
                 chat_id=chat_id,
                 user_id=current_user.id,
@@ -1638,25 +1479,20 @@ async def toggle_channel_subscription(
 # WEBSOCKET
 # ===========================================
 class ConnectionManager:
-    """Управление WebSocket соединениями"""
     def __init__(self):
         self.active_connections: Dict[int, WebSocket] = {}
-        self.user_sessions: Dict[int, str] = {}  # user_id -> session_id
 
     async def connect(self, websocket: WebSocket, user_id: int):
-        """Подключение пользователя"""
         await websocket.accept()
         self.active_connections[user_id] = websocket
         logger.info(f"User {user_id} connected via WebSocket")
 
     def disconnect(self, user_id: int):
-        """Отключение пользователя"""
         if user_id in self.active_connections:
             del self.active_connections[user_id]
         logger.info(f"User {user_id} disconnected from WebSocket")
 
     async def send_personal_message(self, message: dict, user_id: int):
-        """Отправка сообщения конкретному пользователю"""
         if user_id in self.active_connections:
             try:
                 await self.active_connections[user_id].send_json(message)
@@ -1667,7 +1503,6 @@ class ConnectionManager:
         return False
 
     async def broadcast_to_chat(self, message: dict, chat_id: int, db: Session):
-        """Отправка сообщения всем участникам чата"""
         members = db.query(ChatMember).filter(ChatMember.chat_id == chat_id).all()
         for member in members:
             await self.send_personal_message(message, member.user_id)
@@ -1676,30 +1511,23 @@ manager = ConnectionManager()
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket, token: str = Query(...), db: Session = Depends(get_db)):
-    """
-    WebSocket подключение для обмена сообщениями в реальном времени
-    """
     user = None
     try:
-        # Аутентификация по токену
         user = get_current_user(token, db)
         await manager.connect(websocket, user.id)
         
-        # Обновление статуса пользователя
         user.is_online = True
         user.last_seen = datetime.utcnow()
         db.commit()
         
-        # Уведомление о статусе
         await manager.broadcast_to_chat({
             "type": "status",
             "user_id": user.id,
             "is_online": True
-        }, None, db)  # TODO: Уведомлять только друзей/участников чатов
+        }, None, db)
         
         logger.info(f"WebSocket connected for user {user.username} (ID: {user.id})")
         
-        # Обработка сообщений от клиента
         while True:
             try:
                 data = await websocket.receive_text()
@@ -1707,7 +1535,6 @@ async def websocket_endpoint(websocket: WebSocket, token: str = Query(...), db: 
                 message_type = message.get("type")
                 
                 if message_type == "message":
-                    # Обработка сообщения
                     chat_id = message.get("chat_id")
                     message_id = message.get("message_id")
                     send_id = message.get("send_id")
@@ -1716,7 +1543,6 @@ async def websocket_endpoint(websocket: WebSocket, token: str = Query(...), db: 
                     file_type = message.get("file_type")
                     file_name = message.get("file_name")
                     
-                    # Проверка, что пользователь участник чата
                     member = db.query(ChatMember).filter(
                         ChatMember.chat_id == chat_id,
                         ChatMember.user_id == user.id
@@ -1729,7 +1555,6 @@ async def websocket_endpoint(websocket: WebSocket, token: str = Query(...), db: 
                         })
                         continue
                     
-                    # Проверка блокировки
                     blocked = db.query(UserBlock).filter(
                         (UserBlock.blocker_id == user.id) | (UserBlock.blocked_id == user.id)
                     ).first()
@@ -1741,7 +1566,6 @@ async def websocket_endpoint(websocket: WebSocket, token: str = Query(...), db: 
                         })
                         continue
                     
-                    # Проверка уникальности message_id
                     existing = db.query(Message).filter(
                         Message.message_id == message_id
                     ).first()
@@ -1753,7 +1577,6 @@ async def websocket_endpoint(websocket: WebSocket, token: str = Query(...), db: 
                         })
                         continue
                     
-                    # Сохранение сообщения в БД
                     new_message = Message(
                         message_id=message_id,
                         send_id=send_id,
@@ -1768,7 +1591,6 @@ async def websocket_endpoint(websocket: WebSocket, token: str = Query(...), db: 
                     db.add(new_message)
                     db.commit()
                     
-                    # Отправка всем участникам чата (кроме отправителя)
                     response_message = {
                         "type": "message",
                         "message_id": message_id,
@@ -1782,14 +1604,12 @@ async def websocket_endpoint(websocket: WebSocket, token: str = Query(...), db: 
                         "created_at": new_message.created_at.isoformat()
                     }
                     
-                    # Получение всех участников чата
                     members = db.query(ChatMember).filter(ChatMember.chat_id == chat_id).all()
                     for member in members:
-                        if member.user_id != user.id:  # Отправителю не отправляем его же сообщение
+                        if member.user_id != user.id:
                             await manager.send_personal_message(response_message, member.user_id)
                     
                 elif message_type == "delivered":
-                    # Подтверждение доставки
                     message_id = message.get("message_id")
                     send_id = message.get("send_id")
                     
@@ -1802,7 +1622,6 @@ async def websocket_endpoint(websocket: WebSocket, token: str = Query(...), db: 
                         msg.delivered_at = datetime.utcnow()
                         db.commit()
                         
-                        # Уведомление отправителя о доставке
                         await manager.send_personal_message({
                             "type": "delivered",
                             "message_id": message_id,
@@ -1810,7 +1629,6 @@ async def websocket_endpoint(websocket: WebSocket, token: str = Query(...), db: 
                         }, msg.sender_id)
                 
                 elif message_type == "read":
-                    # Отметка о прочтении
                     message_id = message.get("message_id")
                     send_id = message.get("send_id")
                     
@@ -1824,7 +1642,6 @@ async def websocket_endpoint(websocket: WebSocket, token: str = Query(...), db: 
                         msg.read_at = datetime.utcnow()
                         db.commit()
                         
-                        # Уведомление отправителя о прочтении
                         await manager.send_personal_message({
                             "type": "read",
                             "message_id": message_id,
@@ -1849,14 +1666,12 @@ async def websocket_endpoint(websocket: WebSocket, token: str = Query(...), db: 
     except Exception as e:
         logger.error(f"WebSocket connection error: {e}")
     finally:
-        # Обработка отключения
         if user:
             try:
                 user.is_online = False
                 user.last_seen = datetime.utcnow()
                 db.commit()
                 
-                # Уведомление о статусе
                 await manager.broadcast_to_chat({
                     "type": "status",
                     "user_id": user.id,
@@ -1868,7 +1683,7 @@ async def websocket_endpoint(websocket: WebSocket, token: str = Query(...), db: 
         manager.disconnect(user.id if user else -1)
 
 # ===========================================
-# ЗАПУСК ПРИЛОЖЕНИЯ
+# ЗАПУСК
 # ===========================================
 if __name__ == "__main__":
     import uvicorn
