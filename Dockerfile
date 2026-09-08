@@ -1,25 +1,28 @@
-FROM python:3.11-slim
+# Используем официальный образ Python 3.10
+FROM python:3.10-slim
 
+# Устанавливаем рабочую директорию
 WORKDIR /app
 
-# Установка системных зависимостей
+# Устанавливаем системные зависимости
 RUN apt-get update && apt-get install -y \
     gcc \
     && rm -rf /var/lib/apt/lists/*
 
-# Копирование requirements.txt и установка зависимостей
+# Копируем файлы зависимостей
 COPY requirements.txt .
+
+# Устанавливаем Python зависимости
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Копирование кода приложения
+# Копируем код приложения
 COPY server.py .
-COPY uploads/ /app/uploads/
 
-# Создание директорий для загрузок
-RUN mkdir -p /app/uploads/temp /app/uploads/avatars
+# Создаем директории для загрузок
+RUN mkdir -p uploads/temp uploads/avatars
 
-# Открытие порта
+# Открываем порт
 EXPOSE 8000
 
-# Запуск приложения
+# Запускаем приложение
 CMD ["uvicorn", "server:app", "--host", "0.0.0.0", "--port", "8000"]
