@@ -1,79 +1,251 @@
+# -*- coding: utf-8 -*-
+"""
+ARTMessage Backend Server
+Полноценный бэкенд для мессенджера с E2EE шифрованием
+"""
+
+import asyncio
 import os
 import uuid
-import json
-import hashlib
 import shutil
 import logging
-import asyncio
 from datetime import datetime, timedelta
 from typing import Optional, List, Dict, Any
-from contextlib import asynccontextmanager
+from pathlib import Path
 
-from fastapi import FastAPI, HTTPException, Depends, UploadFile, File, Form, Query, WebSocket, WebSocketDisconnect, status
+from fastapi import FastAPI, HTTPException, Depends, status, UploadFile, File, Query, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from fastapi.responses import FileResponse, JSONResponse
-from pydantic import BaseModel, Field, validator, ConfigDict
+from fastapi.responses import FileResponse
+from pydantic import BaseModel, Field, validator
 from sqlalchemy import create_engine, Column, Integer, String, Boolean, DateTime, ForeignKey, Text, Index, UniqueConstraint
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, Session, relationship
 from sqlalchemy.sql import func
+from sqlalchemy.exc import IntegrityError
 from passlib.context import CryptContext
-import jwt
-from datetime import timezone
-import bcrypt
-import aiofiles
-import aiofiles.os as aio_os
-from apscheduler.schedulers.background import BackgroundScheduler
+from jose import JWTError, jwt
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
-import pytz
+import bcrypt
 
 # Настройка логирования
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger(__name__)
 
 # Конфигурация
 SECRET_KEY = os.getenv("SECRET_KEY", "your-secret-key-change-in-production")
 ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_MINUTES = 60
+ACCESS_TOKEN_EXPIRE_MINUTES = 15
 REFRESH_TOKEN_EXPIRE_DAYS = 7
-UPLOAD_TEMP_DIR = "uploads/temp"
-UPLOAD_AVATARS_DIR = "uploads/avatars"
+UPLOAD_DIR = Path("uploads")
+TEMP_DIR = UPLOAD_DIR / "temp"
+AVATAR_DIR = UPLOAD_DIR / "avatars"
+DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///database.db")
 MAX_FILE_SIZE = 500 * 1024  # 500 KB
-ALLOWED_FILE_TYPES = ['image/jpeg', 'image/png', 'image/gif', 'application/pdf', 'text/plain']
 
 # Создание директорий
-os.makedirs(UPLOAD_TEMP_DIR, exist_ok=True)
-os.makedirs(UPLOAD_AVATARS_DIR, exist_ok=True)
+UPLOAD_DIR.mkdir(exist_ok=True)
+TEMP_DIR.mkdir(exist_ok=True, parents=True)
+AVATAR_DIR.mkdir(exist_ok=True, parents=True)
+
+# Инициализация FastAPI
+app = FastAPI(
+    title="ARTMessage API",
+    description="Мессенджер с сквозным шифрованием",
+    version="1.0.0"
+)
+
+# CORS настройки
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # База данных
-DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./artmessage.db")
-engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
+engine = create_engine(
+    DATABASE_URL,
+    connect_args={"check_same_thread": False} if "sqlite" in DATABASE_URL else {}
+)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
-# Безопасность
+# Security
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 security = HTTPBearer()
 
-# Модели Pydantic для валидации
+# WebSocket менеджер
+class ConnectionManager:
+    def __init__(self):
+        self.active_connections: Dict[int, WebSocket] = {}
+        self.connection_sids: Dict[WebSocket, str] = {}
+    
+    async def connect(self, websocket: WebSocket, user_id: int):
+        await websocket.accept()
+        self.active_connections[user_id] = websocket
+        self.connection_sids[websocket] = str(uuid.uuid4())
+        logger.info(f"User {user_id} connected via WebSocket")
+    
+    def disconnect(self, websocket: WebSocket):
+        user_id = None
+        for uid, ws in self.active_connections.items():
+            if ws == websocket:
+                user_id = uid
+                break
+        if user_id:
+            del self.active_connections[user_id]
+        if websocket in self.connection_sids:
+            del self.connection_sids[websocket]
+        logger.info(f"User {user_id} disconnected from WebSocket")
+        return user_id
+    
+    async def send_message(self, user_id: int, message: dict):
+        if user_id in self.active_connections:
+            try:
+                await self.active_connections[user_id].send_json(message)
+                return True
+            except Exception as e:
+                logger.error(f"Error sending message to user {user_id}: {e}")
+                return False
+        return False
+
+manager = ConnectionManager()
+
+# ======================== МОДЕЛИ БД ========================
+
+class User(Base):
+    __tablename__ = "users"
+    
+    id = Column(Integer, primary_key=True, index=True)
+    username = Column(String(50), unique=True, nullable=False, index=True)
+    first_name = Column(String(100), nullable=False)
+    last_name = Column(String(100), nullable=True)
+    bio = Column(Text, nullable=True)
+    password_hash = Column(String(255), nullable=False)
+    avatar_url = Column(String(255), nullable=True)
+    public_key = Column(Text, nullable=False)
+    hardware_id = Column(String(255), unique=True, nullable=False)
+    is_online = Column(Boolean, default=False)
+    last_seen = Column(DateTime, default=func.now())
+    created_at = Column(DateTime, default=func.now())
+    updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
+    
+    # Отношения
+    sent_messages = relationship("Message", foreign_keys="Message.sender_id", back_populates="sender")
+    chat_memberships = relationship("ChatMember", back_populates="user")
+    blocks = relationship("UserBlock", foreign_keys="UserBlock.blocker_id", back_populates="blocker")
+    blocked_by = relationship("UserBlock", foreign_keys="UserBlock.blocked_id", back_populates="blocked")
+
+class Chat(Base):
+    __tablename__ = "chats"
+    
+    id = Column(Integer, primary_key=True, index=True)
+    type = Column(String(20), nullable=False)  # private, group, channel
+    name = Column(String(100), nullable=True)
+    description = Column(Text, nullable=True)
+    avatar_url = Column(String(255), nullable=True)
+    created_by = Column(Integer, ForeignKey("users.id"), nullable=False)
+    created_at = Column(DateTime, default=func.now())
+    
+    # Отношения
+    creator = relationship("User", foreign_keys=[created_by])
+    members = relationship("ChatMember", back_populates="chat")
+    messages = relationship("Message", back_populates="chat")
+
+class ChatMember(Base):
+    __tablename__ = "chat_members"
+    
+    id = Column(Integer, primary_key=True, index=True)
+    chat_id = Column(Integer, ForeignKey("chats.id"), nullable=False)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    role = Column(String(20), nullable=False, default="member")  # creator, admin, member
+    is_pinned = Column(Boolean, default=False)
+    folder = Column(String(50), nullable=True)
+    joined_at = Column(DateTime, default=func.now())
+    
+    # Отношения
+    chat = relationship("Chat", back_populates="members")
+    user = relationship("User", back_populates="chat_memberships")
+    
+    __table_args__ = (
+        UniqueConstraint('chat_id', 'user_id', name='unique_chat_user'),
+    )
+
+class Message(Base):
+    __tablename__ = "messages"
+    
+    id = Column(Integer, primary_key=True, index=True)
+    message_id = Column(String(36), unique=True, nullable=False)
+    send_id = Column(String(36), nullable=False)
+    chat_id = Column(Integer, ForeignKey("chats.id"), nullable=False)
+    sender_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    content = Column(Text, nullable=False)
+    file_url = Column(String(255), nullable=True)
+    file_type = Column(String(20), nullable=True)  # image, document
+    file_name = Column(String(255), nullable=True)
+    is_read = Column(Boolean, default=False)
+    read_at = Column(DateTime, nullable=True)
+    delivered_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=func.now())
+    
+    # Отношения
+    chat = relationship("Chat", back_populates="messages")
+    sender = relationship("User", foreign_keys=[sender_id], back_populates="sent_messages")
+    
+    __table_args__ = (
+        Index('idx_message_chat_id_created_at', 'chat_id', 'created_at'),
+        UniqueConstraint('message_id', 'send_id', name='unique_message_send'),
+    )
+
+class UserBlock(Base):
+    __tablename__ = "user_blocks"
+    
+    id = Column(Integer, primary_key=True, index=True)
+    blocker_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    blocked_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    created_at = Column(DateTime, default=func.now())
+    
+    # Отношения
+    blocker = relationship("User", foreign_keys=[blocker_id], back_populates="blocks")
+    blocked = relationship("User", foreign_keys=[blocked_id], back_populates="blocked_by")
+    
+    __table_args__ = (
+        UniqueConstraint('blocker_id', 'blocked_id', name='unique_block_pair'),
+    )
+
+# Создание таблиц
+Base.metadata.create_all(bind=engine)
+
+# ======================== PYDANTIC СХЕМЫ ========================
+
 class UserCreate(BaseModel):
     username: str = Field(..., min_length=3, max_length=50)
     first_name: str = Field(..., min_length=1, max_length=100)
     last_name: Optional[str] = Field(None, max_length=100)
     bio: Optional[str] = Field(None, max_length=500)
-    password: str = Field(..., min_length=6)
-    public_key: str = Field(..., min_length=10)
+    password: str = Field(..., min_length=8)
+    public_key: str
     hardware_id: str = Field(..., min_length=10)
-    avatar: Optional[UploadFile] = None
+    
+    @validator('username')
+    def validate_username(cls, v):
+        if not v.isalnum() and '_' not in v:
+            raise ValueError('Username должен содержать только буквы, цифры и подчеркивания')
+        return v.lower()
 
 class UserLogin(BaseModel):
     username: str
     password: str
     hardware_id: str
+
+class RefreshToken(BaseModel):
+    refresh_token: str
 
 class UserUpdate(BaseModel):
     username: Optional[str] = Field(None, min_length=3, max_length=50)
@@ -83,150 +255,44 @@ class UserUpdate(BaseModel):
 
 class PasswordChange(BaseModel):
     old_password: str
-    new_password: str = Field(..., min_length=6)
+    new_password: str = Field(..., min_length=8)
 
 class ChatCreate(BaseModel):
     type: str = Field(..., regex="^(private|group|channel)$")
     name: Optional[str] = Field(None, max_length=100)
     description: Optional[str] = Field(None, max_length=500)
-    user_ids: Optional[List[int]] = []
+    members: Optional[List[int]] = []  # IDs пользователей для добавления
+
+class ChatUpdate(BaseModel):
+    name: Optional[str] = Field(None, max_length=100)
+    description: Optional[str] = Field(None, max_length=500)
 
 class MessageCreate(BaseModel):
-    content: str = Field(..., min_length=1)
-    message_id: str = Field(..., min_length=10)  # UUID от клиента
-    send_id: str = Field(..., min_length=10)     # UUID от клиента
-    file_url: Optional[str] = None
-
-class MessageRead(BaseModel):
+    content: str
     message_id: str
     send_id: str
+    file_url: Optional[str] = None
 
-class FolderUpdate(BaseModel):
-    folder: Optional[str] = Field(None, max_length=50)
+class MessageResponse(BaseModel):
+    message_id: str
+    send_id: str
+    sender_id: int
+    chat_id: int
+    content: str
+    file_url: Optional[str]
+    created_at: datetime
 
-class MemberAdd(BaseModel):
-    user_id: int
+class FileUploadResponse(BaseModel):
+    file_id: str
+    url: str
 
-class MemberRole(BaseModel):
-    role: str = Field(..., regex="^(admin|member|creator)$")
-
-class Token(BaseModel):
+class TokenResponse(BaseModel):
     access_token: str
     refresh_token: str
     token_type: str = "bearer"
 
-class TokenRefresh(BaseModel):
-    refresh_token: str
+# ======================== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ========================
 
-# SQLAlchemy модели
-class User(Base):
-    __tablename__ = "users"
-    __table_args__ = (
-        Index('ix_users_username', 'username'),
-        Index('ix_users_hardware_id', 'hardware_id'),
-    )
-
-    id = Column(Integer, primary_key=True, index=True)
-    username = Column(String(50), unique=True, nullable=False, index=True)
-    first_name = Column(String(100), nullable=False)
-    last_name = Column(String(100), nullable=True)
-    bio = Column(Text, nullable=True)
-    password_hash = Column(String(255), nullable=False)
-    avatar_url = Column(String(255), nullable=True)
-    public_key = Column(Text, nullable=False)
-    hardware_id = Column(String(255), unique=True, nullable=False, index=True)
-    is_online = Column(Boolean, default=False)
-    last_seen = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
-    created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
-
-    # Отношения
-    sent_messages = relationship("Message", foreign_keys="Message.sender_id", back_populates="sender")
-    chat_memberships = relationship("ChatMember", back_populates="user")
-    blocked_users = relationship("UserBlock", foreign_keys="UserBlock.blocker_id", back_populates="blocker")
-    blocked_by = relationship("UserBlock", foreign_keys="UserBlock.blocked_id", back_populates="blocked")
-    created_chats = relationship("Chat", back_populates="creator")
-
-class Chat(Base):
-    __tablename__ = "chats"
-
-    id = Column(Integer, primary_key=True, index=True)
-    type = Column(String(20), nullable=False)  # private, group, channel
-    name = Column(String(100), nullable=True)
-    description = Column(Text, nullable=True)
-    avatar_url = Column(String(255), nullable=True)
-    created_by = Column(Integer, ForeignKey("users.id"), nullable=False)
-    created_at = Column(DateTime, default=datetime.utcnow)
-
-    # Отношения
-    creator = relationship("User", foreign_keys=[created_by], back_populates="created_chats")
-    members = relationship("ChatMember", back_populates="chat")
-    messages = relationship("Message", back_populates="chat")
-
-class ChatMember(Base):
-    __tablename__ = "chat_members"
-    __table_args__ = (
-        UniqueConstraint('chat_id', 'user_id', name='uq_chat_member'),
-    )
-
-    id = Column(Integer, primary_key=True, index=True)
-    chat_id = Column(Integer, ForeignKey("chats.id"), nullable=False)
-    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
-    role = Column(String(20), default="member")  # admin, member, creator
-    is_pinned = Column(Boolean, default=False)
-    folder = Column(String(50), nullable=True)
-    joined_at = Column(DateTime, default=datetime.utcnow)
-
-    # Отношения
-    chat = relationship("Chat", back_populates="members")
-    user = relationship("User", back_populates="chat_memberships")
-
-class Message(Base):
-    __tablename__ = "messages"
-    __table_args__ = (
-        Index('ix_messages_chat_id', 'chat_id'),
-        Index('ix_messages_sender_id', 'sender_id'),
-        Index('ix_messages_created_at', 'created_at'),
-        Index('ix_messages_send_id', 'send_id'),
-    )
-
-    id = Column(Integer, primary_key=True, index=True)
-    message_id = Column(String(36), unique=True, nullable=False, index=True)  # UUID клиента
-    send_id = Column(String(36), nullable=False, index=True)  # UUID для пары отправитель-получатель
-    chat_id = Column(Integer, ForeignKey("chats.id"), nullable=False)
-    sender_id = Column(Integer, ForeignKey("users.id"), nullable=False)
-    content = Column(Text, nullable=False)  # Зашифрованный текст
-    file_url = Column(String(255), nullable=True)
-    file_type = Column(String(50), nullable=True)  # image, document
-    file_name = Column(String(255), nullable=True)
-    is_read = Column(Boolean, default=False)
-    read_at = Column(DateTime, nullable=True)
-    delivered_at = Column(DateTime, nullable=True)
-    created_at = Column(DateTime, default=datetime.utcnow)
-
-    # Отношения
-    chat = relationship("Chat", back_populates="messages")
-    sender = relationship("User", foreign_keys=[sender_id], back_populates="sent_messages")
-
-class UserBlock(Base):
-    __tablename__ = "user_blocks"
-    __table_args__ = (
-        UniqueConstraint('blocker_id', 'blocked_id', name='uq_user_block'),
-    )
-
-    id = Column(Integer, primary_key=True, index=True)
-    blocker_id = Column(Integer, ForeignKey("users.id"), nullable=False)
-    blocked_id = Column(Integer, ForeignKey("users.id"), nullable=False)
-    created_at = Column(DateTime, default=datetime.utcnow)
-
-    # Отношения
-    blocker = relationship("User", foreign_keys=[blocker_id], back_populates="blocked_users")
-    blocked = relationship("User", foreign_keys=[blocked_id], back_populates="blocked_by")
-
-# Создание таблиц
-Base.metadata.create_all(bind=engine)
-
-# Вспомогательные функции
 def get_db():
     """Получение сессии базы данных"""
     db = SessionLocal()
@@ -235,333 +301,213 @@ def get_db():
     finally:
         db.close()
 
-def verify_password(plain_password: str, hashed_password: str) -> bool:
-    """Проверка пароля"""
-    return pwd_context.verify(plain_password, hashed_password)
-
-def get_password_hash(password: str) -> str:
+def hash_password(password: str) -> str:
     """Хеширование пароля"""
     return pwd_context.hash(password)
 
-def create_access_token(data: dict, expires_delta: timedelta = None):
+def verify_password(password: str, hashed: str) -> bool:
+    """Проверка пароля"""
+    return pwd_context.verify(password, hashed)
+
+def create_access_token(data: dict) -> str:
     """Создание access токена"""
     to_encode = data.copy()
-    if expires_delta:
-        expire = datetime.utcnow() + expires_delta
-    else:
-        expire = datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    expire = datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
     to_encode.update({"exp": expire, "type": "access"})
-    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
-    return encoded_jwt
+    return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
 
-def create_refresh_token(data: dict):
+def create_refresh_token(data: dict) -> str:
     """Создание refresh токена"""
     to_encode = data.copy()
     expire = datetime.utcnow() + timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS)
     to_encode.update({"exp": expire, "type": "refresh"})
-    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
-    return encoded_jwt
+    return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
 
 def verify_token(token: str) -> dict:
-    """Верификация JWT токена"""
+    """Верификация токена"""
     try:
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
         return payload
-    except jwt.ExpiredSignatureError:
-        raise HTTPException(status_code=401, detail="Token expired")
-    except jwt.InvalidTokenError:
-        raise HTTPException(status_code=401, detail="Invalid token")
+    except JWTError:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Недействительный токен",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
 
-async def get_current_user(
+def get_current_user(
     credentials: HTTPAuthorizationCredentials = Depends(security),
     db: Session = Depends(get_db)
 ) -> User:
-    """Получение текущего пользователя по JWT"""
+    """Получение текущего пользователя из токена"""
     token = credentials.credentials
     payload = verify_token(token)
     user_id = payload.get("sub")
-    if not user_id:
-        raise HTTPException(status_code=401, detail="Invalid token payload")
+    if user_id is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Недействительный токен"
+        )
     
     user = db.query(User).filter(User.id == int(user_id)).first()
-    if not user:
-        raise HTTPException(status_code=401, detail="User not found")
+    if user is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Пользователь не найден"
+        )
     
     return user
 
-def get_user_by_username(db: Session, username: str) -> Optional[User]:
-    """Получение пользователя по username"""
-    return db.query(User).filter(User.username == username).first()
+def save_upload_file(upload_file: UploadFile, directory: Path, filename: str) -> str:
+    """Сохранение загруженного файла"""
+    file_path = directory / filename
+    with open(file_path, "wb") as buffer:
+        shutil.copyfileobj(upload_file.file, buffer)
+    return str(file_path)
 
-def get_user_by_hardware_id(db: Session, hardware_id: str) -> Optional[User]:
-    """Получение пользователя по hardware_id"""
-    return db.query(User).filter(User.hardware_id == hardware_id).first()
+def generate_file_id() -> str:
+    """Генерация уникального ID для файла"""
+    return str(uuid.uuid4())
 
-def is_user_blocked(db: Session, blocker_id: int, blocked_id: int) -> bool:
+def is_user_blocked(db: Session, user_id: int, target_id: int) -> bool:
     """Проверка, заблокирован ли пользователь"""
     block = db.query(UserBlock).filter(
-        UserBlock.blocker_id == blocker_id,
-        UserBlock.blocked_id == blocked_id
+        UserBlock.blocker_id == target_id,
+        UserBlock.blocked_id == user_id
     ).first()
     return block is not None
 
-def can_access_chat(db: Session, user_id: int, chat_id: int) -> bool:
-    """Проверка доступа пользователя к чату"""
-    member = db.query(ChatMember).filter(
-        ChatMember.chat_id == chat_id,
-        ChatMember.user_id == user_id
-    ).first()
-    return member is not None
-
-def can_send_message(db: Session, user_id: int, chat_id: int) -> bool:
-    """Проверка, может ли пользователь отправлять сообщения в чат"""
-    # Проверка доступа к чату
-    if not can_access_chat(db, user_id, chat_id):
-        return False
-    
-    # Проверка, не заблокирован ли пользователь в чате (для приватных чатов)
-    chat = db.query(Chat).filter(Chat.id == chat_id).first()
-    if not chat:
-        return False
-    
-    # Для приватных чатов проверяем, не заблокировал ли получатель отправителя
-    if chat.type == "private":
-        # Находим второго участника
-        members = db.query(ChatMember).filter(ChatMember.chat_id == chat_id).all()
-        other_member = None
-        for member in members:
-            if member.user_id != user_id:
-                other_member = member
-                break
-        
-        if other_member:
-            # Проверяем, не заблокировал ли другой пользователь текущего
-            if is_user_blocked(db, other_member.user_id, user_id):
-                return False
-    
-    return True
-
-# WebSocket менеджер
-class ConnectionManager:
-    def __init__(self):
-        self.active_connections: Dict[int, WebSocket] = {}
-        self.user_status: Dict[int, bool] = {}
-    
-    async def connect(self, websocket: WebSocket, user_id: int):
-        """Подключение пользователя"""
-        await websocket.accept()
-        self.active_connections[user_id] = websocket
-        self.user_status[user_id] = True
-        logger.info(f"User {user_id} connected via WebSocket")
-    
-    def disconnect(self, user_id: int):
-        """Отключение пользователя"""
-        if user_id in self.active_connections:
-            del self.active_connections[user_id]
-        self.user_status[user_id] = False
-        logger.info(f"User {user_id} disconnected from WebSocket")
-    
-    async def send_message(self, user_id: int, message: dict):
-        """Отправка сообщения пользователю"""
-        if user_id in self.active_connections:
-            try:
-                await self.active_connections[user_id].send_json(message)
-                return True
-            except:
-                return False
-        return False
-    
-    async def broadcast_status(self, user_id: int, is_online: bool):
-        """Трансляция статуса пользователя"""
-        status_message = {
-            "type": "status",
-            "user_id": user_id,
-            "is_online": is_online
-        }
-        # Отправляем всем подключенным пользователям
-        for conn_user_id, websocket in self.active_connections.items():
-            if conn_user_id != user_id:
-                try:
-                    await websocket.send_json(status_message)
-                except:
-                    pass
-
-manager = ConnectionManager()
-
-# Фоновые задачи
-def cleanup_temp_files():
-    """Удаление временных файлов старше 15 минут"""
-    logger.info("Running cleanup of temporary files")
-    try:
-        now = datetime.utcnow()
-        for filename in os.listdir(UPLOAD_TEMP_DIR):
-            filepath = os.path.join(UPLOAD_TEMP_DIR, filename)
-            try:
-                stat = os.stat(filepath)
-                if stat.st_mtime < (now - timedelta(minutes=15)).timestamp():
-                    os.remove(filepath)
-                    logger.info(f"Deleted old temp file: {filename}")
-            except Exception as e:
-                logger.error(f"Error deleting file {filename}: {e}")
-    except Exception as e:
-        logger.error(f"Error in cleanup task: {e}")
-
-def update_offline_status():
-    """Обновление статуса офлайн для пользователей без активного WebSocket"""
-    logger.info("Updating offline status")
-    try:
-        db = SessionLocal()
+async def send_online_status(user_id: int, is_online: bool):
+    """Отправка статуса онлайна всем пользователям"""
+    status_message = {
+        "type": "status",
+        "user_id": user_id,
+        "is_online": is_online
+    }
+    for ws in manager.active_connections.values():
         try:
-            # Пользователи, которые online, но не имеют активного WebSocket
-            online_users = db.query(User).filter(User.is_online == True).all()
-            for user in online_users:
-                if user.id not in manager.active_connections:
-                    user.is_online = False
-                    user.last_seen = datetime.utcnow()
-                    db.add(user)
-                    # Транслируем статус
-                    asyncio.create_task(manager.broadcast_status(user.id, False))
-            db.commit()
-        finally:
-            db.close()
-    except Exception as e:
-        logger.error(f"Error updating offline status: {e}")
+            await ws.send_json(status_message)
+        except:
+            pass
 
-# Создание и запуск шедулера
-scheduler = BackgroundScheduler()
-scheduler.add_job(cleanup_temp_files, IntervalTrigger(minutes=5))
-scheduler.add_job(update_offline_status, IntervalTrigger(minutes=2))
-scheduler.start()
+# ======================== ФОНОВЫЕ ЗАДАЧИ ========================
 
-# FastAPI приложение
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    """Lifespan менеджер для управления жизненным циклом приложения"""
-    logger.info("Starting ARTMessage backend...")
-    yield
-    logger.info("Shutting down ARTMessage backend...")
-    scheduler.shutdown()
-
-app = FastAPI(
-    title="ARTMessage API",
-    description="Messenger backend with E2EE",
-    version="1.0.0",
-    lifespan=lifespan
-)
-
-# CORS настройка
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://localhost:3000", "http://localhost:8000"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# REST эндпоинты
-
-# Auth endpoints
-@app.post("/auth/register", response_model=dict)
-async def register_user(
-    username: str = Form(...),
-    first_name: str = Form(...),
-    last_name: Optional[str] = Form(None),
-    bio: Optional[str] = Form(None),
-    password: str = Form(...),
-    public_key: str = Form(...),
-    hardware_id: str = Form(...),
-    avatar: Optional[UploadFile] = File(None),
-    db: Session = Depends(get_db)
-):
-    """
-    Регистрация нового пользователя
-    
-    Принимает данные пользователя и создает аккаунт.
-    """
+async def cleanup_temp_files():
+    """Удаление временных файлов старше 15 минут"""
     try:
-        # Проверка уникальности username
-        if get_user_by_username(db, username):
-            raise HTTPException(status_code=400, detail="Username already taken")
+        logger.info("Запуск очистки временных файлов...")
+        now = datetime.now()
+        for file_path in TEMP_DIR.glob("*"):
+            if file_path.is_file():
+                file_age = now - datetime.fromtimestamp(file_path.stat().st_mtime)
+                if file_age > timedelta(minutes=15):
+                    file_path.unlink()
+                    logger.info(f"Удалён временный файл: {file_path}")
+    except Exception as e:
+        logger.error(f"Ошибка при очистке временных файлов: {e}")
+
+def setup_scheduler():
+    """Настройка планировщика"""
+    scheduler = AsyncIOScheduler()
+    scheduler.add_job(
+        cleanup_temp_files,
+        trigger=IntervalTrigger(minutes=5),
+        id="cleanup_temp_files"
+    )
+    scheduler.start()
+    logger.info("Планировщик фоновых задач запущен")
+
+# Запуск планировщика при старте
+@app.on_event("startup")
+async def startup_event():
+    setup_scheduler()
+    logger.info("Сервер ARTMessage запущен!")
+
+# ======================== REST ЭНДПОИНТЫ ========================
+
+# --- АУТЕНТИФИКАЦИЯ ---
+
+@app.post("/auth/register", response_model=TokenResponse)
+async def register(user_data: UserCreate, db: Session = Depends(get_db)):
+    """Регистрация нового пользователя"""
+    try:
+        # Проверка существования пользователя
+        existing_user = db.query(User).filter(
+            (User.username == user_data.username) |
+            (User.hardware_id == user_data.hardware_id)
+        ).first()
         
-        # Проверка уникальности hardware_id
-        if get_user_by_hardware_id(db, hardware_id):
-            raise HTTPException(status_code=400, detail="Hardware ID already registered")
-        
-        # Хеширование пароля
-        password_hash = get_password_hash(password)
+        if existing_user:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Пользователь с таким username или hardware_id уже существует"
+            )
         
         # Создание пользователя
-        user = User(
-            username=username,
-            first_name=first_name,
-            last_name=last_name,
-            bio=bio,
-            password_hash=password_hash,
-            public_key=public_key,
-            hardware_id=hardware_id,
-            is_online=False,
-            last_seen=datetime.utcnow()
+        new_user = User(
+            username=user_data.username,
+            first_name=user_data.first_name,
+            last_name=user_data.last_name,
+            bio=user_data.bio,
+            password_hash=hash_password(user_data.password),
+            public_key=user_data.public_key,
+            hardware_id=user_data.hardware_id
         )
         
-        db.add(user)
+        db.add(new_user)
         db.commit()
-        db.refresh(user)
+        db.refresh(new_user)
         
-        # Обработка аватара
-        if avatar:
-            try:
-                # Создание директории для аватаров, если не существует
-                os.makedirs(UPLOAD_AVATARS_DIR, exist_ok=True)
-                
-                # Сохранение аватара
-                file_extension = os.path.splitext(avatar.filename)[1]
-                avatar_filename = f"user_{user.id}_{uuid.uuid4().hex}{file_extension}"
-                avatar_path = os.path.join(UPLOAD_AVATARS_DIR, avatar_filename)
-                
-                async with aiofiles.open(avatar_path, 'wb') as out_file:
-                    content = await avatar.read()
-                    await out_file.write(content)
-                
-                user.avatar_url = f"/files/avatars/{avatar_filename}"
-                db.commit()
-                
-            except Exception as e:
-                logger.error(f"Error saving avatar: {e}")
+        # Создание токенов
+        access_token = create_access_token({"sub": str(new_user.id)})
+        refresh_token = create_refresh_token({"sub": str(new_user.id)})
         
-        logger.info(f"User registered: {username} (ID: {user.id})")
-        return {"message": "User registered successfully", "user_id": user.id}
+        logger.info(f"Зарегистрирован новый пользователь: {new_user.username} (ID: {new_user.id})")
         
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Registration error: {e}")
+        return {
+            "access_token": access_token,
+            "refresh_token": refresh_token,
+            "token_type": "bearer"
+        }
+        
+    except IntegrityError:
         db.rollback()
-        raise HTTPException(status_code=500, detail=f"Registration failed: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Ошибка при создании пользователя"
+        )
+    except Exception as e:
+        db.rollback()
+        logger.error(f"Ошибка при регистрации: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Внутренняя ошибка сервера"
+        )
 
-@app.post("/auth/login", response_model=Token)
-async def login_user(user_data: UserLogin, db: Session = Depends(get_db)):
-    """
-    Вход пользователя
-    
-    Проверяет учетные данные и возвращает токены доступа.
-    """
+@app.post("/auth/login", response_model=TokenResponse)
+async def login(user_data: UserLogin, db: Session = Depends(get_db)):
+    """Вход пользователя"""
     try:
-        user = get_user_by_username(db, user_data.username)
+        user = db.query(User).filter(User.username == user_data.username).first()
+        
         if not user:
-            raise HTTPException(status_code=401, detail="Invalid username or password")
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Неверный username или пароль"
+            )
         
         if not verify_password(user_data.password, user.password_hash):
-            raise HTTPException(status_code=401, detail="Invalid username or password")
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Неверный username или пароль"
+            )
         
-        # Обновление hardware_id при входе
+        # Обновление hardware_id если изменился
         if user.hardware_id != user_data.hardware_id:
-            # Проверяем, не занят ли hardware_id другим пользователем
-            if get_user_by_hardware_id(db, user_data.hardware_id):
-                raise HTTPException(status_code=400, detail="Hardware ID already in use")
             user.hardware_id = user_data.hardware_id
             db.commit()
         
-        # Обновление статуса
+        # Обновление статуса онлайн
         user.is_online = True
         user.last_seen = datetime.utcnow()
         db.commit()
@@ -570,126 +516,147 @@ async def login_user(user_data: UserLogin, db: Session = Depends(get_db)):
         access_token = create_access_token({"sub": str(user.id)})
         refresh_token = create_refresh_token({"sub": str(user.id)})
         
-        # Трансляция статуса
-        asyncio.create_task(manager.broadcast_status(user.id, True))
+        logger.info(f"Пользователь {user.username} вошёл в систему")
         
-        logger.info(f"User logged in: {user.username} (ID: {user.id})")
-        return {"access_token": access_token, "refresh_token": refresh_token}
+        # Отправка статуса онлайн
+        await send_online_status(user.id, True)
+        
+        return {
+            "access_token": access_token,
+            "refresh_token": refresh_token,
+            "token_type": "bearer"
+        }
         
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Login error: {e}")
-        raise HTTPException(status_code=500, detail=f"Login failed: {str(e)}")
+        logger.error(f"Ошибка при входе: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Внутренняя ошибка сервера"
+        )
 
-@app.post("/auth/refresh", response_model=Token)
-async def refresh_token(refresh_data: TokenRefresh, db: Session = Depends(get_db)):
-    """
-    Обновление токена доступа
-    
-    Использует refresh token для получения нового access token.
-    """
+@app.post("/auth/refresh", response_model=TokenResponse)
+async def refresh_token(refresh_data: RefreshToken, db: Session = Depends(get_db)):
+    """Обновление access токена"""
     try:
         payload = verify_token(refresh_data.refresh_token)
+        
         if payload.get("type") != "refresh":
-            raise HTTPException(status_code=401, detail="Invalid token type")
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Недействительный refresh токен"
+            )
         
         user_id = payload.get("sub")
         user = db.query(User).filter(User.id == int(user_id)).first()
+        
         if not user:
-            raise HTTPException(status_code=401, detail="User not found")
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Пользователь не найден"
+            )
         
-        access_token = create_access_token({"sub": str(user.id)})
-        refresh_token = create_refresh_token({"sub": str(user.id)})
+        new_access_token = create_access_token({"sub": str(user.id)})
         
-        return {"access_token": access_token, "refresh_token": refresh_token}
+        return {
+            "access_token": new_access_token,
+            "refresh_token": refresh_data.refresh_token,
+            "token_type": "bearer"
+        }
         
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Refresh token error: {e}")
-        raise HTTPException(status_code=500, detail=f"Token refresh failed: {str(e)}")
+        logger.error(f"Ошибка при обновлении токена: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Внутренняя ошибка сервера"
+        )
 
 @app.post("/auth/logout")
-async def logout_user(current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    """
-    Выход пользователя
-    
-    Обновляет статус пользователя на офлайн.
-    """
+async def logout(current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Выход из системы"""
     try:
         current_user.is_online = False
         current_user.last_seen = datetime.utcnow()
         db.commit()
         
-        # Трансляция статуса
-        asyncio.create_task(manager.broadcast_status(current_user.id, False))
+        logger.info(f"Пользователь {current_user.username} вышел из системы")
         
-        logger.info(f"User logged out: {current_user.username} (ID: {current_user.id})")
-        return {"message": "Logged out successfully"}
+        # Отправка статуса офлайн
+        await send_online_status(current_user.id, False)
+        
+        return {"message": "Выход выполнен успешно"}
         
     except Exception as e:
-        logger.error(f"Logout error: {e}")
-        raise HTTPException(status_code=500, detail=f"Logout failed: {str(e)}")
+        logger.error(f"Ошибка при выходе: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Внутренняя ошибка сервера"
+        )
 
-# User endpoints
+# --- ПРОФИЛЬ ---
+
 @app.get("/user/me")
-async def get_current_user_profile(current_user: User = Depends(get_current_user)):
-    """
-    Получение профиля текущего пользователя
-    """
-    try:
-        return {
-            "id": current_user.id,
-            "username": current_user.username,
-            "first_name": current_user.first_name,
-            "last_name": current_user.last_name,
-            "bio": current_user.bio,
-            "avatar_url": current_user.avatar_url,
-            "public_key": current_user.public_key,
-            "is_online": current_user.is_online,
-            "last_seen": current_user.last_seen.isoformat() if current_user.last_seen else None,
-            "created_at": current_user.created_at.isoformat() if current_user.created_at else None
-        }
-    except Exception as e:
-        logger.error(f"Get profile error: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to get profile: {str(e)}")
+async def get_profile(current_user: User = Depends(get_current_user)):
+    """Получение профиля текущего пользователя"""
+    return {
+        "id": current_user.id,
+        "username": current_user.username,
+        "first_name": current_user.first_name,
+        "last_name": current_user.last_name,
+        "bio": current_user.bio,
+        "avatar_url": current_user.avatar_url,
+        "public_key": current_user.public_key,
+        "is_online": current_user.is_online,
+        "last_seen": current_user.last_seen,
+        "created_at": current_user.created_at
+    }
 
 @app.put("/user/me")
-async def update_user_profile(
-    user_update: UserUpdate,
+async def update_profile(
+    update_data: UserUpdate,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    """
-    Обновление профиля пользователя
-    """
+    """Обновление профиля"""
     try:
-        # Проверка уникальности username при изменении
-        if user_update.username and user_update.username != current_user.username:
-            if get_user_by_username(db, user_update.username):
-                raise HTTPException(status_code=400, detail="Username already taken")
-            current_user.username = user_update.username
+        if update_data.username:
+            # Проверка уникальности username
+            existing = db.query(User).filter(
+                User.username == update_data.username,
+                User.id != current_user.id
+            ).first()
+            if existing:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Username уже используется"
+                )
+            current_user.username = update_data.username
         
-        if user_update.first_name:
-            current_user.first_name = user_update.first_name
-        if user_update.last_name is not None:
-            current_user.last_name = user_update.last_name
-        if user_update.bio is not None:
-            current_user.bio = user_update.bio
+        if update_data.first_name:
+            current_user.first_name = update_data.first_name
+        if update_data.last_name is not None:
+            current_user.last_name = update_data.last_name
+        if update_data.bio is not None:
+            current_user.bio = update_data.bio
         
         current_user.updated_at = datetime.utcnow()
         db.commit()
         
-        logger.info(f"Profile updated for user: {current_user.username} (ID: {current_user.id})")
-        return {"message": "Profile updated successfully"}
+        logger.info(f"Профиль пользователя {current_user.username} обновлён")
+        return {"message": "Профиль обновлён успешно"}
         
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Update profile error: {e}")
         db.rollback()
-        raise HTTPException(status_code=500, detail=f"Profile update failed: {str(e)}")
+        logger.error(f"Ошибка при обновлении профиля: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Внутренняя ошибка сервера"
+        )
 
 @app.put("/user/me/password")
 async def change_password(
@@ -697,92 +664,101 @@ async def change_password(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    """
-    Смена пароля пользователя
-    """
+    """Смена пароля"""
     try:
-        # Проверка старого пароля
         if not verify_password(password_data.old_password, current_user.password_hash):
-            raise HTTPException(status_code=400, detail="Incorrect old password")
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Неверный текущий пароль"
+            )
         
-        # Установка нового пароля
-        current_user.password_hash = get_password_hash(password_data.new_password)
+        current_user.password_hash = hash_password(password_data.new_password)
         current_user.updated_at = datetime.utcnow()
         db.commit()
         
-        logger.info(f"Password changed for user: {current_user.username} (ID: {current_user.id})")
-        return {"message": "Password changed successfully"}
+        logger.info(f"Пароль пользователя {current_user.username} изменён")
+        return {"message": "Пароль изменён успешно"}
         
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Change password error: {e}")
         db.rollback()
-        raise HTTPException(status_code=500, detail=f"Password change failed: {str(e)}")
+        logger.error(f"Ошибка при смене пароля: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Внутренняя ошибка сервера"
+        )
 
 @app.post("/user/me/avatar")
 async def upload_avatar(
-    avatar: UploadFile = File(...),
+    file: UploadFile = File(...),
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    """
-    Загрузка аватара пользователя
-    """
+    """Загрузка аватарки"""
     try:
         # Проверка типа файла
-        if avatar.content_type not in ['image/jpeg', 'image/png', 'image/gif']:
-            raise HTTPException(status_code=400, detail="Only JPEG, PNG, GIF images are allowed")
+        if file.content_type not in ["image/jpeg", "image/png", "image/gif"]:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Допустимы только изображения (JPEG, PNG, GIF)"
+            )
         
         # Проверка размера
-        content = await avatar.read()
-        if len(content) > 5 * 1024 * 1024:  # 5 MB
-            raise HTTPException(status_code=400, detail="Avatar size exceeds 5 MB")
+        file.file.seek(0, 2)
+        size = file.file.tell()
+        file.file.seek(0)
+        if size > MAX_FILE_SIZE:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Размер файла превышает {MAX_FILE_SIZE // 1024} КБ"
+            )
         
-        # Удаление старого аватара
+        # Сохранение файла
+        file_id = generate_file_id()
+        file_extension = file.filename.split('.')[-1]
+        filename = f"avatar_{current_user.id}_{file_id}.{file_extension}"
+        file_path = save_upload_file(file, AVATAR_DIR, filename)
+        
+        # Удаление старой аватарки
         if current_user.avatar_url:
-            old_avatar_path = current_user.avatar_url.replace("/files/avatars/", "")
-            old_avatar_full_path = os.path.join(UPLOAD_AVATARS_DIR, old_avatar_path)
-            if os.path.exists(old_avatar_full_path):
-                os.remove(old_avatar_full_path)
+            old_path = Path(current_user.avatar_url)
+            if old_path.exists():
+                old_path.unlink()
         
-        # Сохранение нового аватара
-        file_extension = os.path.splitext(avatar.filename)[1]
-        avatar_filename = f"user_{current_user.id}_{uuid.uuid4().hex}{file_extension}"
-        avatar_path = os.path.join(UPLOAD_AVATARS_DIR, avatar_filename)
-        
-        async with aiofiles.open(avatar_path, 'wb') as out_file:
-            await out_file.write(content)
-        
-        current_user.avatar_url = f"/files/avatars/{avatar_filename}"
+        current_user.avatar_url = file_path
         current_user.updated_at = datetime.utcnow()
         db.commit()
         
-        logger.info(f"Avatar uploaded for user: {current_user.username} (ID: {current_user.id})")
-        return {"message": "Avatar uploaded successfully", "avatar_url": current_user.avatar_url}
+        logger.info(f"Аватарка пользователя {current_user.username} обновлена")
+        
+        return {
+            "message": "Аватарка загружена успешно",
+            "avatar_url": file_path
+        }
         
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Upload avatar error: {e}")
         db.rollback()
-        raise HTTPException(status_code=500, detail=f"Avatar upload failed: {str(e)}")
+        logger.error(f"Ошибка при загрузке аватарки: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Внутренняя ошибка сервера"
+        )
 
 @app.get("/user/search")
 async def search_users(
-    q: str = Query(..., min_length=1, max_length=50),
+    q: str = Query(..., min_length=1),
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    """
-    Поиск пользователей по username
-    """
+    """Поиск пользователей по username"""
     try:
-        # Поиск с автодополнением
         users = db.query(User).filter(
-            User.username.ilike(f"{q}%"),
+            User.username.contains(q),
             User.id != current_user.id
-        ).limit(10).all()
+        ).limit(20).all()
         
         return [{
             "id": user.id,
@@ -794,177 +770,134 @@ async def search_users(
         } for user in users]
         
     except Exception as e:
-        logger.error(f"Search users error: {e}")
-        raise HTTPException(status_code=500, detail=f"Search failed: {str(e)}")
+        logger.error(f"Ошибка при поиске пользователей: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Внутренняя ошибка сервера"
+        )
 
-# Chat endpoints
+# --- ЧАТЫ ---
+
 @app.post("/chats")
 async def create_chat(
     chat_data: ChatCreate,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    """
-    Создание нового чата
-    """
+    """Создание нового чата"""
     try:
         # Создание чата
-        chat = Chat(
+        new_chat = Chat(
             type=chat_data.type,
             name=chat_data.name if chat_data.type != "private" else None,
-            description=chat_data.description,
+            description=chat_data.description if chat_data.type != "private" else None,
             created_by=current_user.id
         )
-        db.add(chat)
-        db.commit()
-        db.refresh(chat)
+        db.add(new_chat)
+        db.flush()
         
-        # Добавление создателя как участника
+        # Добавление создателя
         creator_member = ChatMember(
-            chat_id=chat.id,
+            chat_id=new_chat.id,
             user_id=current_user.id,
-            role="creator" if chat.type != "private" else "member"
+            role="creator"
         )
         db.add(creator_member)
         
-        # Для приватного чата добавляем второго участника
-        if chat.type == "private" and chat_data.user_ids:
-            # Для приватного чата должен быть указан один пользователь
-            if len(chat_data.user_ids) != 1:
-                db.delete(chat)
-                db.commit()
-                raise HTTPException(status_code=400, detail="Private chat requires exactly one other user")
-            
-            other_user_id = chat_data.user_ids[0]
-            # Проверка, что пользователь существует и не заблокирован
-            other_user = db.query(User).filter(User.id == other_user_id).first()
-            if not other_user:
-                db.delete(chat)
-                db.commit()
-                raise HTTPException(status_code=404, detail="User not found")
-            
-            # Проверка блокировки
-            if is_user_blocked(db, other_user_id, current_user.id) or is_user_blocked(db, current_user.id, other_user_id):
-                db.delete(chat)
-                db.commit()
-                raise HTTPException(status_code=403, detail="User is blocked")
-            
-            # Проверка существования приватного чата между этими пользователями
-            existing_chat = db.query(Chat).join(ChatMember).filter(
-                Chat.type == "private",
-                ChatMember.user_id.in_([current_user.id, other_user_id])
-            ).group_by(Chat.id).having(func.count(ChatMember.user_id) == 2).first()
-            
-            if existing_chat:
-                db.delete(chat)
-                db.commit()
-                return {"message": "Private chat already exists", "chat_id": existing_chat.id}
-            
-            member = ChatMember(
-                chat_id=chat.id,
-                user_id=other_user_id,
-                role="member"
-            )
-            db.add(member)
-        
-        # Для группы добавляем указанных пользователей
-        elif chat.type == "group" and chat_data.user_ids:
-            for user_id in chat_data.user_ids:
-                # Проверка, что пользователь не заблокирован
-                if not is_user_blocked(db, user_id, current_user.id) and not is_user_blocked(db, current_user.id, user_id):
+        # Добавление участников для групп и каналов
+        if chat_data.type in ["group", "channel"]:
+            for user_id in chat_data.members:
+                if user_id != current_user.id:
                     member = ChatMember(
-                        chat_id=chat.id,
+                        chat_id=new_chat.id,
                         user_id=user_id,
                         role="member"
                     )
                     db.add(member)
         
         db.commit()
+        db.refresh(new_chat)
         
-        logger.info(f"Chat created: {chat.id} by user {current_user.id}")
-        return {"message": "Chat created successfully", "chat_id": chat.id}
+        logger.info(f"Создан чат ID: {new_chat.id} типа {chat_data.type} пользователем {current_user.username}")
         
-    except HTTPException:
-        raise
+        return {
+            "id": new_chat.id,
+            "type": new_chat.type,
+            "name": new_chat.name,
+            "created_at": new_chat.created_at
+        }
+        
     except Exception as e:
-        logger.error(f"Create chat error: {e}")
         db.rollback()
-        raise HTTPException(status_code=500, detail=f"Chat creation failed: {str(e)}")
+        logger.error(f"Ошибка при создании чата: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Внутренняя ошибка сервера"
+        )
 
 @app.get("/chats")
-async def get_user_chats(
-    page: int = Query(1, ge=1),
-    limit: int = Query(20, ge=1, le=100),
+async def get_chats(
+    skip: int = Query(0, ge=0),
+    limit: int = Query(50, ge=1, le=100),
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    """
-    Получение списка чатов пользователя с пагинацией
-    """
+    """Получение списка чатов пользователя"""
     try:
-        offset = (page - 1) * limit
-        
-        # Получение чатов пользователя
-        chats = db.query(Chat).join(ChatMember).filter(
+        chat_members = db.query(ChatMember).filter(
             ChatMember.user_id == current_user.id
-        ).order_by(Chat.created_at.desc()).offset(offset).limit(limit).all()
+        ).offset(skip).limit(limit).all()
         
         result = []
-        for chat in chats:
-            # Получение информации о чате
-            members = db.query(ChatMember).filter(ChatMember.chat_id == chat.id).all()
-            member_count = len(members)
+        for member in chat_members:
+            chat = member.chat
             
             # Получение последнего сообщения
             last_message = db.query(Message).filter(
                 Message.chat_id == chat.id
             ).order_by(Message.created_at.desc()).first()
             
-            # Получение информации о текущем пользователе в чате
-            current_member = db.query(ChatMember).filter(
-                ChatMember.chat_id == chat.id,
-                ChatMember.user_id == current_user.id
-            ).first()
+            # Получение непрочитанных
+            unread_count = db.query(Message).filter(
+                Message.chat_id == chat.id,
+                Message.is_read == False,
+                Message.sender_id != current_user.id
+            ).count()
             
-            # Для приватных чатов получаем имя другого участника
+            # Для приватных чатов получаем имя собеседника
             chat_name = chat.name
             if chat.type == "private":
-                other_member = None
-                for member in members:
-                    if member.user_id != current_user.id:
-                        other_member = member
-                        break
+                other_member = db.query(ChatMember).filter(
+                    ChatMember.chat_id == chat.id,
+                    ChatMember.user_id != current_user.id
+                ).first()
                 if other_member:
-                    other_user = db.query(User).filter(User.id == other_member.user_id).first()
-                    if other_user:
-                        chat_name = f"{other_user.first_name} {other_user.last_name or ''}".strip() or other_user.username
+                    chat_name = f"{other_member.user.first_name} {other_member.user.last_name or ''}".strip()
             
             result.append({
                 "id": chat.id,
                 "type": chat.type,
                 "name": chat_name,
                 "avatar_url": chat.avatar_url,
-                "member_count": member_count,
                 "last_message": {
-                    "content": last_message.content if last_message else None,
-                    "created_at": last_message.created_at.isoformat() if last_message else None,
+                    "content": last_message.content[:50] if last_message else None,
+                    "created_at": last_message.created_at if last_message else None,
                     "sender_id": last_message.sender_id if last_message else None
                 } if last_message else None,
-                "is_pinned": current_member.is_pinned if current_member else False,
-                "folder": current_member.folder if current_member else None,
-                "created_at": chat.created_at.isoformat()
+                "unread_count": unread_count,
+                "is_pinned": member.is_pinned,
+                "folder": member.folder,
+                "created_at": chat.created_at
             })
         
-        return {
-            "chats": result,
-            "page": page,
-            "limit": limit,
-            "total": db.query(ChatMember).filter(ChatMember.user_id == current_user.id).count()
-        }
+        return result
         
     except Exception as e:
-        logger.error(f"Get chats error: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to get chats: {str(e)}")
+        logger.error(f"Ошибка при получении чатов: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Внутренняя ошибка сервера"
+        )
 
 @app.get("/chats/{chat_id}")
 async def get_chat_details(
@@ -972,40 +905,37 @@ async def get_chat_details(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    """
-    Получение деталей чата
-    """
+    """Детальная информация о чате"""
     try:
         # Проверка доступа
-        if not can_access_chat(db, current_user.id, chat_id):
-            raise HTTPException(status_code=403, detail="Access denied")
-        
-        chat = db.query(Chat).filter(Chat.id == chat_id).first()
-        if not chat:
-            raise HTTPException(status_code=404, detail="Chat not found")
-        
-        # Получение участников
-        members = db.query(ChatMember).filter(ChatMember.chat_id == chat_id).all()
-        member_list = []
-        for member in members:
-            user = db.query(User).filter(User.id == member.user_id).first()
-            if user:
-                member_list.append({
-                    "user_id": user.id,
-                    "username": user.username,
-                    "first_name": user.first_name,
-                    "last_name": user.last_name,
-                    "avatar_url": user.avatar_url,
-                    "role": member.role,
-                    "is_online": user.is_online,
-                    "joined_at": member.joined_at.isoformat()
-                })
-        
-        # Получение информации о текущем пользователе
-        current_member = db.query(ChatMember).filter(
+        member = db.query(ChatMember).filter(
             ChatMember.chat_id == chat_id,
             ChatMember.user_id == current_user.id
         ).first()
+        
+        if not member:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Нет доступа к этому чату"
+            )
+        
+        chat = db.query(Chat).filter(Chat.id == chat_id).first()
+        if not chat:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Чат не найден"
+            )
+        
+        # Получение участников
+        members = db.query(ChatMember).filter(ChatMember.chat_id == chat_id).all()
+        members_list = [{
+            "user_id": m.user_id,
+            "username": m.user.username,
+            "first_name": m.user.first_name,
+            "last_name": m.user.last_name,
+            "role": m.role,
+            "joined_at": m.joined_at
+        } for m in members]
         
         return {
             "id": chat.id,
@@ -1014,19 +944,19 @@ async def get_chat_details(
             "description": chat.description,
             "avatar_url": chat.avatar_url,
             "created_by": chat.created_by,
-            "created_at": chat.created_at.isoformat(),
-            "members": member_list,
-            "member_count": len(member_list),
-            "current_user_role": current_member.role if current_member else None,
-            "is_pinned": current_member.is_pinned if current_member else False,
-            "folder": current_member.folder if current_member else None
+            "created_at": chat.created_at,
+            "members": members_list,
+            "member_count": len(members_list)
         }
         
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Get chat details error: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to get chat details: {str(e)}")
+        logger.error(f"Ошибка при получении чата: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Внутренняя ошибка сервера"
+        )
 
 @app.delete("/chats/{chat_id}")
 async def delete_chat(
@@ -1034,22 +964,20 @@ async def delete_chat(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    """
-    Удаление чата (только для создателя или админа)
-    """
+    """Удаление чата (только создатель)"""
     try:
         chat = db.query(Chat).filter(Chat.id == chat_id).first()
         if not chat:
-            raise HTTPException(status_code=404, detail="Chat not found")
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Чат не найден"
+            )
         
-        # Проверка прав
-        member = db.query(ChatMember).filter(
-            ChatMember.chat_id == chat_id,
-            ChatMember.user_id == current_user.id
-        ).first()
-        
-        if not member or member.role not in ["creator", "admin"]:
-            raise HTTPException(status_code=403, detail="Insufficient permissions")
+        if chat.created_by != current_user.id:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Только создатель может удалить чат"
+            )
         
         # Удаление всех сообщений
         db.query(Message).filter(Message.chat_id == chat_id).delete()
@@ -1061,25 +989,26 @@ async def delete_chat(
         db.delete(chat)
         db.commit()
         
-        logger.info(f"Chat {chat_id} deleted by user {current_user.id}")
-        return {"message": "Chat deleted successfully"}
+        logger.info(f"Чат {chat_id} удалён пользователем {current_user.username}")
+        return {"message": "Чат удалён успешно"}
         
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Delete chat error: {e}")
         db.rollback()
-        raise HTTPException(status_code=500, detail=f"Failed to delete chat: {str(e)}")
+        logger.error(f"Ошибка при удалении чата: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Внутренняя ошибка сервера"
+        )
 
 @app.post("/chats/{chat_id}/pin")
-async def toggle_pin_chat(
+async def pin_chat(
     chat_id: int,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    """
-    Закрепление/открепление чата
-    """
+    """Закрепление/открепление чата"""
     try:
         member = db.query(ChatMember).filter(
             ChatMember.chat_id == chat_id,
@@ -1087,31 +1016,37 @@ async def toggle_pin_chat(
         ).first()
         
         if not member:
-            raise HTTPException(status_code=403, detail="Access denied")
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Нет доступа к этому чату"
+            )
         
         member.is_pinned = not member.is_pinned
         db.commit()
         
-        logger.info(f"Chat {chat_id} pin toggled by user {current_user.id}")
-        return {"message": "Chat pin toggled", "is_pinned": member.is_pinned}
+        status = "закреплён" if member.is_pinned else "откреплён"
+        logger.info(f"Чат {chat_id} {status} пользователем {current_user.username}")
+        
+        return {"message": f"Чат {status} успешно", "is_pinned": member.is_pinned}
         
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Pin chat error: {e}")
         db.rollback()
-        raise HTTPException(status_code=500, detail=f"Failed to toggle pin: {str(e)}")
+        logger.error(f"Ошибка при закреплении чата: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Внутренняя ошибка сервера"
+        )
 
 @app.put("/chats/{chat_id}/folder")
-async def move_chat_to_folder(
+async def move_to_folder(
     chat_id: int,
-    folder_data: FolderUpdate,
+    folder: str = Query(..., max_length=50),
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    """
-    Перемещение чата в папку
-    """
+    """Перемещение чата в папку"""
     try:
         member = db.query(ChatMember).filter(
             ChatMember.chat_id == chat_id,
@@ -1119,268 +1054,242 @@ async def move_chat_to_folder(
         ).first()
         
         if not member:
-            raise HTTPException(status_code=403, detail="Access denied")
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Нет доступа к этому чату"
+            )
         
-        member.folder = folder_data.folder
+        member.folder = folder if folder.strip() else None
         db.commit()
         
-        logger.info(f"Chat {chat_id} moved to folder '{folder_data.folder}' by user {current_user.id}")
-        return {"message": "Chat moved to folder", "folder": member.folder}
+        logger.info(f"Чат {chat_id} перемещён в папку '{folder}'")
+        return {"message": "Чат перемещён в папку", "folder": member.folder}
         
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Move chat to folder error: {e}")
         db.rollback()
-        raise HTTPException(status_code=500, detail=f"Failed to move chat: {str(e)}")
+        logger.error(f"Ошибка при перемещении чата: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Внутренняя ошибка сервера"
+        )
 
 @app.post("/chats/{chat_id}/members")
-async def add_chat_member(
+async def add_member(
     chat_id: int,
-    member_data: MemberAdd,
+    user_id: int,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    """
-    Добавление участника в чат
-    """
+    """Добавление участника в чат"""
     try:
-        chat = db.query(Chat).filter(Chat.id == chat_id).first()
-        if not chat:
-            raise HTTPException(status_code=404, detail="Chat not found")
-        
-        # Проверка прав (только создатель или админ могут добавлять участников)
-        if chat.type == "private":
-            raise HTTPException(status_code=400, detail="Cannot add members to private chat")
-        
-        current_member = db.query(ChatMember).filter(
+        # Проверка прав
+        member = db.query(ChatMember).filter(
             ChatMember.chat_id == chat_id,
             ChatMember.user_id == current_user.id
         ).first()
         
-        if not current_member or current_member.role not in ["creator", "admin"]:
-            raise HTTPException(status_code=403, detail="Insufficient permissions")
-        
-        # Проверка, что пользователь существует
-        user_to_add = db.query(User).filter(User.id == member_data.user_id).first()
-        if not user_to_add:
-            raise HTTPException(status_code=404, detail="User not found")
+        if not member or member.role not in ["creator", "admin"]:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Только создатель или администратор может добавлять участников"
+            )
         
         # Проверка, не заблокирован ли пользователь
-        if is_user_blocked(db, user_to_add.id, current_user.id) or is_user_blocked(db, current_user.id, user_to_add.id):
-            raise HTTPException(status_code=403, detail="User is blocked")
-        
-        # Проверка, не состоит ли уже в чате
-        existing_member = db.query(ChatMember).filter(
-            ChatMember.chat_id == chat_id,
-            ChatMember.user_id == member_data.user_id
-        ).first()
-        
-        if existing_member:
-            raise HTTPException(status_code=400, detail="User already in chat")
+        if is_user_blocked(db, user_id, current_user.id):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Вы заблокировали этого пользователя"
+            )
         
         # Добавление участника
         new_member = ChatMember(
             chat_id=chat_id,
-            user_id=member_data.user_id,
+            user_id=user_id,
             role="member"
         )
         db.add(new_member)
         db.commit()
         
-        logger.info(f"User {member_data.user_id} added to chat {chat_id} by user {current_user.id}")
-        return {"message": "Member added successfully"}
+        logger.info(f"Пользователь {user_id} добавлен в чат {chat_id}")
+        return {"message": "Участник добавлен успешно"}
         
     except HTTPException:
         raise
-    except Exception as e:
-        logger.error(f"Add chat member error: {e}")
+    except IntegrityError:
         db.rollback()
-        raise HTTPException(status_code=500, detail=f"Failed to add member: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Пользователь уже является участником чата"
+        )
+    except Exception as e:
+        db.rollback()
+        logger.error(f"Ошибка при добавлении участника: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Внутренняя ошибка сервера"
+        )
 
 @app.delete("/chats/{chat_id}/members/{user_id}")
-async def remove_chat_member(
+async def remove_member(
     chat_id: int,
     user_id: int,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    """
-    Удаление участника из чата
-    """
+    """Удаление участника из чата"""
     try:
-        chat = db.query(Chat).filter(Chat.id == chat_id).first()
-        if not chat:
-            raise HTTPException(status_code=404, detail="Chat not found")
-        
-        if chat.type == "private":
-            raise HTTPException(status_code=400, detail="Cannot remove members from private chat")
-        
-        current_member = db.query(ChatMember).filter(
-            ChatMember.chat_id == chat_id,
-            ChatMember.user_id == current_user.id
-        ).first()
-        
-        if not current_member:
-            raise HTTPException(status_code=403, detail="Access denied")
-        
-        # Нельзя удалить создателя
-        if current_user.id == user_id and current_member.role == "creator":
-            raise HTTPException(status_code=403, detail="Cannot remove creator")
-        
-        # Проверка прав для удаления других пользователей
-        if current_user.id != user_id and current_member.role not in ["creator", "admin"]:
-            raise HTTPException(status_code=403, detail="Insufficient permissions")
-        
-        # Удаление участника
-        member_to_remove = db.query(ChatMember).filter(
-            ChatMember.chat_id == chat_id,
-            ChatMember.user_id == user_id
-        ).first()
-        
-        if not member_to_remove:
-            raise HTTPException(status_code=404, detail="Member not found")
-        
-        # Если удаляем создателя, то передаем создателя админу
-        if member_to_remove.role == "creator":
-            # Находим первого админа для передачи прав
-            new_creator = db.query(ChatMember).filter(
-                ChatMember.chat_id == chat_id,
-                ChatMember.role == "admin"
-            ).first()
-            
-            if new_creator:
-                new_creator.role = "creator"
-            else:
-                # Если нет админов, делаем создателем текущего пользователя
-                current_member.role = "creator"
-        
-        db.delete(member_to_remove)
-        db.commit()
-        
-        logger.info(f"User {user_id} removed from chat {chat_id} by user {current_user.id}")
-        return {"message": "Member removed successfully"}
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Remove chat member error: {e}")
-        db.rollback()
-        raise HTTPException(status_code=500, detail=f"Failed to remove member: {str(e)}")
-
-@app.put("/chats/{chat_id}/members/{user_id}/role")
-async def update_member_role(
-    chat_id: int,
-    user_id: int,
-    role_data: MemberRole,
-    current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db)
-):
-    """
-    Изменение роли участника
-    """
-    try:
-        chat = db.query(Chat).filter(Chat.id == chat_id).first()
-        if not chat:
-            raise HTTPException(status_code=404, detail="Chat not found")
-        
-        if chat.type == "private":
-            raise HTTPException(status_code=400, detail="Cannot change roles in private chat")
-        
+        # Проверка прав
         current_member = db.query(ChatMember).filter(
             ChatMember.chat_id == chat_id,
             ChatMember.user_id == current_user.id
         ).first()
         
         if not current_member or current_member.role not in ["creator", "admin"]:
-            raise HTTPException(status_code=403, detail="Insufficient permissions")
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Только создатель или администратор может удалять участников"
+            )
         
-        member_to_update = db.query(ChatMember).filter(
+        # Нельзя удалить создателя
+        target_member = db.query(ChatMember).filter(
             ChatMember.chat_id == chat_id,
             ChatMember.user_id == user_id
         ).first()
         
-        if not member_to_update:
-            raise HTTPException(status_code=404, detail="Member not found")
+        if not target_member:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Участник не найден"
+            )
         
-        # Нельзя изменить роль создателя
-        if member_to_update.role == "creator":
-            raise HTTPException(status_code=403, detail="Cannot change creator role")
+        if target_member.role == "creator":
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Нельзя удалить создателя чата"
+            )
         
-        # Если меняем на creator, то должен быть создателем
-        if role_data.role == "creator" and current_member.role != "creator":
-            raise HTTPException(status_code=403, detail="Only creator can assign creator role")
-        
-        member_to_update.role = role_data.role
+        db.delete(target_member)
         db.commit()
         
-        logger.info(f"Role updated for user {user_id} in chat {chat_id} by user {current_user.id}")
-        return {"message": "Role updated successfully"}
+        logger.info(f"Пользователь {user_id} удалён из чата {chat_id}")
+        return {"message": "Участник удалён успешно"}
         
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Update member role error: {e}")
         db.rollback()
-        raise HTTPException(status_code=500, detail=f"Failed to update role: {str(e)}")
+        logger.error(f"Ошибка при удалении участника: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Внутренняя ошибка сервера"
+        )
 
-# Message endpoints
-@app.get("/chats/{chat_id}/messages")
-async def get_chat_messages(
+@app.put("/chats/{chat_id}/members/{user_id}/role")
+async def change_role(
     chat_id: int,
-    page: int = Query(1, ge=1),
+    user_id: int,
+    role: str = Query(..., regex="^(admin|member)$"),
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Изменение роли участника"""
+    try:
+        # Проверка прав
+        current_member = db.query(ChatMember).filter(
+            ChatMember.chat_id == chat_id,
+            ChatMember.user_id == current_user.id
+        ).first()
+        
+        if not current_member or current_member.role not in ["creator", "admin"]:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Только создатель или администратор может менять роли"
+            )
+        
+        target_member = db.query(ChatMember).filter(
+            ChatMember.chat_id == chat_id,
+            ChatMember.user_id == user_id
+        ).first()
+        
+        if not target_member:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Участник не найден"
+            )
+        
+        if target_member.role == "creator":
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Нельзя изменить роль создателя"
+            )
+        
+        target_member.role = role
+        db.commit()
+        
+        logger.info(f"Роль пользователя {user_id} в чате {chat_id} изменена на {role}")
+        return {"message": f"Роль изменена на {role}"}
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        db.rollback()
+        logger.error(f"Ошибка при изменении роли: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Внутренняя ошибка сервера"
+        )
+
+# --- СООБЩЕНИЯ ---
+
+@app.get("/chats/{chat_id}/messages")
+async def get_messages(
+    chat_id: int,
+    skip: int = Query(0, ge=0),
     limit: int = Query(20, ge=1, le=100),
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    """
-    Получение истории сообщений чата с пагинацией
-    """
+    """Получение истории сообщений"""
     try:
         # Проверка доступа
-        if not can_access_chat(db, current_user.id, chat_id):
-            raise HTTPException(status_code=403, detail="Access denied")
+        member = db.query(ChatMember).filter(
+            ChatMember.chat_id == chat_id,
+            ChatMember.user_id == current_user.id
+        ).first()
         
-        offset = (page - 1) * limit
+        if not member:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Нет доступа к этому чату"
+            )
         
         messages = db.query(Message).filter(
             Message.chat_id == chat_id
-        ).order_by(Message.created_at.desc()).offset(offset).limit(limit).all()
+        ).order_by(Message.created_at.desc()).offset(skip).limit(limit).all()
         
-        # Получение информации о отправителях
-        result = []
-        for message in messages:
-            sender = db.query(User).filter(User.id == message.sender_id).first()
-            result.append({
-                "id": message.id,
-                "message_id": message.message_id,
-                "send_id": message.send_id,
-                "sender_id": message.sender_id,
-                "sender_username": sender.username if sender else None,
-                "sender_first_name": sender.first_name if sender else None,
-                "sender_last_name": sender.last_name if sender else None,
-                "content": message.content,  # Зашифрованный текст
-                "file_url": message.file_url,
-                "file_type": message.file_type,
-                "file_name": message.file_name,
-                "is_read": message.is_read,
-                "read_at": message.read_at.isoformat() if message.read_at else None,
-                "delivered_at": message.delivered_at.isoformat() if message.delivered_at else None,
-                "created_at": message.created_at.isoformat()
-            })
-        
-        return {
-            "messages": result,
-            "page": page,
-            "limit": limit,
-            "total": db.query(Message).filter(Message.chat_id == chat_id).count()
-        }
+        return [{
+            "message_id": msg.message_id,
+            "send_id": msg.send_id,
+            "sender_id": msg.sender_id,
+            "chat_id": msg.chat_id,
+            "content": msg.content,
+            "file_url": msg.file_url,
+            "file_type": msg.file_type,
+            "file_name": msg.file_name,
+            "is_read": msg.is_read,
+            "created_at": msg.created_at
+        } for msg in messages]
         
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Get messages error: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to get messages: {str(e)}")
+        logger.error(f"Ошибка при получении сообщений: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Внутренняя ошибка сервера"
+        )
 
 @app.post("/chats/{chat_id}/messages")
 async def send_message(
@@ -1389,24 +1298,35 @@ async def send_message(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    """
-    Отправка сообщения в чат
-    """
+    """Отправка сообщения через REST (для синхронных запросов)"""
     try:
-        # Проверка прав на отправку сообщения
-        if not can_send_message(db, current_user.id, chat_id):
-            raise HTTPException(status_code=403, detail="Cannot send message")
-        
-        # Проверка уникальности message_id
-        existing_message = db.query(Message).filter(
-            Message.message_id == message_data.message_id
+        # Проверка доступа
+        member = db.query(ChatMember).filter(
+            ChatMember.chat_id == chat_id,
+            ChatMember.user_id == current_user.id
         ).first()
         
-        if existing_message:
-            raise HTTPException(status_code=400, detail="Message ID already exists")
+        if not member:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Нет доступа к этому чату"
+            )
+        
+        # Проверка блокировки
+        chat = db.query(Chat).filter(Chat.id == chat_id).first()
+        if chat.type == "private":
+            other_member = db.query(ChatMember).filter(
+                ChatMember.chat_id == chat_id,
+                ChatMember.user_id != current_user.id
+            ).first()
+            if other_member and is_user_blocked(db, current_user.id, other_member.user_id):
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="Вы заблокировали этого пользователя"
+                )
         
         # Создание сообщения
-        message = Message(
+        new_message = Message(
             message_id=message_data.message_id,
             send_id=message_data.send_id,
             chat_id=chat_id,
@@ -1414,246 +1334,238 @@ async def send_message(
             content=message_data.content,
             file_url=message_data.file_url
         )
-        
-        db.add(message)
+        db.add(new_message)
         db.commit()
-        db.refresh(message)
+        db.refresh(new_message)
         
-        # Получение отправителя
-        sender = db.query(User).filter(User.id == current_user.id).first()
+        logger.info(f"Сообщение {message_data.message_id} отправлено в чат {chat_id}")
         
-        # Отправка сообщения через WebSocket всем участникам чата
-        members = db.query(ChatMember).filter(ChatMember.chat_id == chat_id).all()
-        for member in members:
-            if member.user_id != current_user.id:  # Не отправляем отправителю
-                # Проверка, не заблокирован ли отправитель получателем
-                if not is_user_blocked(db, member.user_id, current_user.id):
-                    ws_message = {
-                        "type": "message",
-                        "message_id": message.message_id,
-                        "send_id": message.send_id,
-                        "sender_id": message.sender_id,
-                        "chat_id": message.chat_id,
-                        "content": message.content,
-                        "file_url": message.file_url,
-                        "created_at": message.created_at.isoformat()
-                    }
-                    await manager.send_message(member.user_id, ws_message)
-        
-        logger.info(f"Message sent: {message.message_id} by user {current_user.id} in chat {chat_id}")
-        return {
-            "message": "Message sent successfully",
-            "message_id": message.message_id,
-            "send_id": message.send_id,
-            "created_at": message.created_at.isoformat()
+        # Отправка через WebSocket
+        message_response = {
+            "type": "message",
+            "message_id": new_message.message_id,
+            "send_id": new_message.send_id,
+            "sender_id": new_message.sender_id,
+            "chat_id": new_message.chat_id,
+            "content": new_message.content,
+            "file_url": new_message.file_url,
+            "created_at": new_message.created_at.isoformat()
         }
+        
+        # Рассылка всем участникам чата
+        members = db.query(ChatMember).filter(ChatMember.chat_id == chat_id).all()
+        for m in members:
+            if m.user_id != current_user.id:  # Не отправляем отправителю
+                await manager.send_message(m.user_id, message_response)
+        
+        return message_response
         
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Send message error: {e}")
         db.rollback()
-        raise HTTPException(status_code=500, detail=f"Failed to send message: {str(e)}")
+        logger.error(f"Ошибка при отправке сообщения: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Внутренняя ошибка сервера"
+        )
 
 @app.put("/messages/{message_id}/read")
-async def mark_message_read(
+async def mark_as_read(
     message_id: str,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    """
-    Отметка сообщения как прочитанного
-    """
+    """Отметка сообщения как прочитанного"""
     try:
         message = db.query(Message).filter(Message.message_id == message_id).first()
+        
         if not message:
-            raise HTTPException(status_code=404, detail="Message not found")
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Сообщение не найдено"
+            )
         
-        # Проверка доступа к чату
-        if not can_access_chat(db, current_user.id, message.chat_id):
-            raise HTTPException(status_code=403, detail="Access denied")
-        
-        # Нельзя отметить свое сообщение как прочитанное
         if message.sender_id == current_user.id:
-            raise HTTPException(status_code=400, detail="Cannot mark own message as read")
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Нельзя отметить своё сообщение как прочитанное"
+            )
         
         message.is_read = True
         message.read_at = datetime.utcnow()
         db.commit()
         
-        # Отправка подтверждения через WebSocket
-        ws_message = {
+        # Отправка уведомления
+        await manager.send_message(message.sender_id, {
             "type": "read",
             "message_id": message.message_id,
             "send_id": message.send_id
-        }
-        await manager.send_message(message.sender_id, ws_message)
+        })
         
-        logger.info(f"Message {message_id} marked as read by user {current_user.id}")
-        return {"message": "Message marked as read"}
+        logger.info(f"Сообщение {message_id} отмечено как прочитанное пользователем {current_user.username}")
+        return {"message": "Сообщение отмечено как прочитанное"}
         
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Mark message read error: {e}")
         db.rollback()
-        raise HTTPException(status_code=500, detail=f"Failed to mark message as read: {str(e)}")
+        logger.error(f"Ошибка при отметке прочитанного: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Внутренняя ошибка сервера"
+        )
 
 @app.get("/messages/unread")
 async def get_unread_count(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    """
-    Получение количества непрочитанных сообщений
-    """
+    """Количество непрочитанных сообщений"""
     try:
         # Получение всех чатов пользователя
-        chat_ids = db.query(ChatMember.chat_id).filter(
+        chat_ids = [m.chat_id for m in db.query(ChatMember).filter(
             ChatMember.user_id == current_user.id
-        ).all()
-        chat_ids = [chat_id[0] for chat_id in chat_ids]
+        ).all()]
         
-        # Подсчет непрочитанных сообщений
         unread_count = db.query(Message).filter(
             Message.chat_id.in_(chat_ids),
-            Message.sender_id != current_user.id,
-            Message.is_read == False
+            Message.is_read == False,
+            Message.sender_id != current_user.id
         ).count()
         
         return {"unread_count": unread_count}
         
     except Exception as e:
-        logger.error(f"Get unread count error: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to get unread count: {str(e)}")
+        logger.error(f"Ошибка при подсчёте непрочитанных: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Внутренняя ошибка сервера"
+        )
 
-# File endpoints
-@app.post("/upload/temp")
+# --- ФАЙЛЫ ---
+
+@app.post("/upload/temp", response_model=FileUploadResponse)
 async def upload_temp_file(
     file: UploadFile = File(...),
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    """
-    Загрузка временного файла (до 500 KB)
-    """
+    """Загрузка временного файла"""
     try:
         # Проверка типа файла
-        if file.content_type not in ALLOWED_FILE_TYPES:
-            raise HTTPException(status_code=400, detail="File type not allowed")
+        allowed_types = ["image/jpeg", "image/png", "image/gif", "application/pdf", "text/plain"]
+        if file.content_type not in allowed_types:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Неподдерживаемый тип файла"
+            )
         
         # Проверка размера
-        content = await file.read()
-        if len(content) > MAX_FILE_SIZE:
-            raise HTTPException(status_code=400, detail=f"File size exceeds {MAX_FILE_SIZE // 1024} KB")
-        
-        # Генерация имени файла
-        file_extension = os.path.splitext(file.filename)[1]
-        temp_filename = f"temp_{uuid.uuid4().hex}{file_extension}"
-        temp_path = os.path.join(UPLOAD_TEMP_DIR, temp_filename)
+        file.file.seek(0, 2)
+        size = file.file.tell()
+        file.file.seek(0)
+        if size > MAX_FILE_SIZE:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Размер файла превышает {MAX_FILE_SIZE // 1024} КБ"
+            )
         
         # Сохранение файла
-        async with aiofiles.open(temp_path, 'wb') as out_file:
-            await out_file.write(content)
+        file_id = generate_file_id()
+        original_filename = file.filename
+        filename = f"{file_id}_{original_filename}"
+        file_path = save_upload_file(file, TEMP_DIR, filename)
         
-        # Определение типа файла
-        file_type = "image" if file.content_type.startswith("image/") else "document"
+        logger.info(f"Временный файл {file_id} загружен пользователем {current_user.username}")
         
-        logger.info(f"Temp file uploaded: {temp_filename} by user {current_user.id}")
         return {
-            "message": "File uploaded successfully",
-            "file_url": f"/files/temp/{temp_filename}",
-            "file_type": file_type,
-            "file_name": file.filename,
-            "file_size": len(content)
+            "file_id": file_id,
+            "url": file_path
         }
         
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Upload temp file error: {e}")
-        raise HTTPException(status_code=500, detail=f"File upload failed: {str(e)}")
+        logger.error(f"Ошибка при загрузке файла: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Внутренняя ошибка сервера"
+        )
 
-@app.get("/files/{file_path:path}")
+@app.get("/files/{file_id}")
 async def get_file(
-    file_path: str,
+    file_id: str,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    """
-    Скачивание файла с проверкой прав доступа
-    """
+    """Скачивание файла"""
     try:
-        # Разделяем путь на тип и имя файла
-        parts = file_path.split('/')
-        if len(parts) < 2:
-            raise HTTPException(status_code=400, detail="Invalid file path")
+        # Поиск файла в папках
+        temp_path = TEMP_DIR / file_id
+        avatar_path = AVATAR_DIR / file_id
         
-        file_type = parts[0]
-        filename = '/'.join(parts[1:])
+        file_path = None
+        if temp_path.exists():
+            file_path = temp_path
+        elif avatar_path.exists():
+            file_path = avatar_path
         
-        if file_type == "avatars":
-            # Аватары доступны всем
-            full_path = os.path.join(UPLOAD_AVATARS_DIR, filename)
-            if not os.path.exists(full_path):
-                raise HTTPException(status_code=404, detail="File not found")
-            return FileResponse(full_path)
-            
-        elif file_type == "temp":
-            # Временные файлы требуют проверки доступа
-            full_path = os.path.join(UPLOAD_TEMP_DIR, filename)
-            if not os.path.exists(full_path):
-                raise HTTPException(status_code=404, detail="File not found")
-            
-            # Проверка, имеет ли пользователь доступ к этому файлу
-            # Ищем сообщение с этим файлом
-            message = db.query(Message).filter(
-                Message.file_url.like(f"%{filename}")
-            ).first()
-            
-            if not message:
-                raise HTTPException(status_code=403, detail="Access denied")
-            
-            # Проверяем, является ли пользователь участником чата
-            if not can_access_chat(db, current_user.id, message.chat_id):
-                raise HTTPException(status_code=403, detail="Access denied")
-            
-            return FileResponse(full_path)
-        else:
-            raise HTTPException(status_code=400, detail="Invalid file type")
+        if not file_path:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Файл не найден"
+            )
+        
+        return FileResponse(
+            path=str(file_path),
+            filename=file_path.name
+        )
         
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Get file error: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to get file: {str(e)}")
+        logger.error(f"Ошибка при скачивании файла: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Внутренняя ошибка сервера"
+        )
 
-# Block endpoints
+# --- БЛОКИРОВКИ ---
+
 @app.post("/blocks/{user_id}")
 async def block_user(
     user_id: int,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    """
-    Блокировка пользователя
-    """
+    """Блокировка пользователя"""
     try:
         if user_id == current_user.id:
-            raise HTTPException(status_code=400, detail="Cannot block yourself")
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Нельзя заблокировать самого себя"
+            )
         
-        user_to_block = db.query(User).filter(User.id == user_id).first()
-        if not user_to_block:
-            raise HTTPException(status_code=404, detail="User not found")
+        # Проверка существования
+        user = db.query(User).filter(User.id == user_id).first()
+        if not user:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Пользователь не найден"
+            )
         
-        # Проверка существующей блокировки
+        # Проверка, не заблокирован ли уже
         existing_block = db.query(UserBlock).filter(
             UserBlock.blocker_id == current_user.id,
             UserBlock.blocked_id == user_id
         ).first()
         
         if existing_block:
-            raise HTTPException(status_code=400, detail="User already blocked")
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Пользователь уже заблокирован"
+            )
         
         # Создание блокировки
         block = UserBlock(
@@ -1663,45 +1575,18 @@ async def block_user(
         db.add(block)
         db.commit()
         
-        # Удаление из чатов, если есть
-        # Находим общие чаты
-        user_chats = db.query(ChatMember.chat_id).filter(
-            ChatMember.user_id == current_user.id
-        ).all()
-        user_chat_ids = [chat[0] for chat in user_chats]
-        
-        blocked_chats = db.query(ChatMember.chat_id).filter(
-            ChatMember.user_id == user_id,
-            ChatMember.chat_id.in_(user_chat_ids)
-        ).all()
-        blocked_chat_ids = [chat[0] for chat in blocked_chats]
-        
-        # Удаляем из общих чатов
-        for chat_id in blocked_chat_ids:
-            chat = db.query(Chat).filter(Chat.id == chat_id).first()
-            if chat and chat.type == "private":
-                # Удаляем приватный чат
-                db.query(Message).filter(Message.chat_id == chat_id).delete()
-                db.query(ChatMember).filter(ChatMember.chat_id == chat_id).delete()
-                db.delete(chat)
-            else:
-                # Удаляем из группового чата
-                db.query(ChatMember).filter(
-                    ChatMember.chat_id == chat_id,
-                    ChatMember.user_id == user_id
-                ).delete()
-        
-        db.commit()
-        
-        logger.info(f"User {user_id} blocked by user {current_user.id}")
-        return {"message": "User blocked successfully"}
+        logger.info(f"Пользователь {current_user.username} заблокировал {user.username}")
+        return {"message": "Пользователь заблокирован"}
         
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Block user error: {e}")
         db.rollback()
-        raise HTTPException(status_code=500, detail=f"Failed to block user: {str(e)}")
+        logger.error(f"Ошибка при блокировке: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Внутренняя ошибка сервера"
+        )
 
 @app.delete("/blocks/{user_id}")
 async def unblock_user(
@@ -1709,9 +1594,7 @@ async def unblock_user(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    """
-    Разблокировка пользователя
-    """
+    """Разблокировка пользователя"""
     try:
         block = db.query(UserBlock).filter(
             UserBlock.blocker_id == current_user.id,
@@ -1719,88 +1602,81 @@ async def unblock_user(
         ).first()
         
         if not block:
-            raise HTTPException(status_code=404, detail="User not blocked")
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Пользователь не заблокирован"
+            )
         
         db.delete(block)
         db.commit()
         
-        logger.info(f"User {user_id} unblocked by user {current_user.id}")
-        return {"message": "User unblocked successfully"}
+        logger.info(f"Пользователь {current_user.username} разблокировал пользователя {user_id}")
+        return {"message": "Пользователь разблокирован"}
         
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Unblock user error: {e}")
         db.rollback()
-        raise HTTPException(status_code=500, detail=f"Failed to unblock user: {str(e)}")
+        logger.error(f"Ошибка при разблокировке: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Внутренняя ошибка сервера"
+        )
 
 @app.get("/blocks")
-async def get_blocked_users(
+async def get_blocks(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    """
-    Получение списка заблокированных пользователей
-    """
+    """Список заблокированных пользователей"""
     try:
         blocks = db.query(UserBlock).filter(
             UserBlock.blocker_id == current_user.id
         ).all()
         
-        result = []
-        for block in blocks:
-            user = db.query(User).filter(User.id == block.blocked_id).first()
-            if user:
-                result.append({
-                    "id": user.id,
-                    "username": user.username,
-                    "first_name": user.first_name,
-                    "last_name": user.last_name,
-                    "avatar_url": user.avatar_url,
-                    "blocked_at": block.created_at.isoformat()
-                })
-        
-        return {"blocked_users": result}
+        return [{
+            "user_id": b.blocked_id,
+            "username": b.blocked.username,
+            "first_name": b.blocked.first_name,
+            "last_name": b.blocked.last_name,
+            "created_at": b.created_at
+        } for b in blocks]
         
     except Exception as e:
-        logger.error(f"Get blocked users error: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to get blocked users: {str(e)}")
+        logger.error(f"Ошибка при получении списка блокировок: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Внутренняя ошибка сервера"
+        )
 
-# Channel endpoints
+# --- КАНАЛЫ ---
+
 @app.post("/channels/{chat_id}/subscribe")
-async def subscribe_to_channel(
+async def subscribe_channel(
     chat_id: int,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    """
-    Подписка/отписка на канал
-    """
+    """Подписка/отписка от канала"""
     try:
-        chat = db.query(Chat).filter(
-            Chat.id == chat_id,
-            Chat.type == "channel"
-        ).first()
+        chat = db.query(Chat).filter(Chat.id == chat_id).first()
+        if not chat or chat.type != "channel":
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Канал не найден"
+            )
         
-        if not chat:
-            raise HTTPException(status_code=404, detail="Channel not found")
-        
-        # Проверка, не заблокирован ли пользователь
-        if is_user_blocked(db, chat.created_by, current_user.id):
-            raise HTTPException(status_code=403, detail="You are blocked by the channel creator")
-        
-        # Проверка существующей подписки
-        existing_member = db.query(ChatMember).filter(
+        member = db.query(ChatMember).filter(
             ChatMember.chat_id == chat_id,
             ChatMember.user_id == current_user.id
         ).first()
         
-        if existing_member:
+        if member:
             # Отписка
-            db.delete(existing_member)
+            db.delete(member)
             db.commit()
-            logger.info(f"User {current_user.id} unsubscribed from channel {chat_id}")
-            return {"message": "Unsubscribed from channel"}
+            logger.info(f"Пользователь {current_user.username} отписался от канала {chat_id}")
+            return {"message": "Вы отписались от канала"}
         else:
             # Подписка
             new_member = ChatMember(
@@ -1810,297 +1686,285 @@ async def subscribe_to_channel(
             )
             db.add(new_member)
             db.commit()
-            logger.info(f"User {current_user.id} subscribed to channel {chat_id}")
-            return {"message": "Subscribed to channel"}
+            logger.info(f"Пользователь {current_user.username} подписался на канал {chat_id}")
+            return {"message": "Вы подписались на канал"}
         
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Channel subscribe error: {e}")
         db.rollback()
-        raise HTTPException(status_code=500, detail=f"Failed to subscribe: {str(e)}")
+        logger.error(f"Ошибка при подписке на канал: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Внутренняя ошибка сервера"
+        )
 
 @app.get("/channels")
-async def get_public_channels(
-    page: int = Query(1, ge=1),
+async def get_channels(
+    skip: int = Query(0, ge=0),
     limit: int = Query(20, ge=1, le=100),
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    """
-    Получение списка публичных каналов
-    """
+    """Список публичных каналов"""
     try:
-        offset = (page - 1) * limit
-        
         channels = db.query(Chat).filter(
             Chat.type == "channel"
-        ).order_by(Chat.created_at.desc()).offset(offset).limit(limit).all()
+        ).offset(skip).limit(limit).all()
         
         result = []
         for channel in channels:
-            # Получение количества подписчиков
-            member_count = db.query(ChatMember).filter(
-                ChatMember.chat_id == channel.id
-            ).count()
-            
             # Проверка, подписан ли пользователь
             is_subscribed = db.query(ChatMember).filter(
                 ChatMember.chat_id == channel.id,
                 ChatMember.user_id == current_user.id
             ).first() is not None
             
-            creator = db.query(User).filter(User.id == channel.created_by).first()
+            member_count = db.query(ChatMember).filter(
+                ChatMember.chat_id == channel.id
+            ).count()
             
             result.append({
                 "id": channel.id,
                 "name": channel.name,
                 "description": channel.description,
                 "avatar_url": channel.avatar_url,
-                "creator": {
-                    "id": creator.id if creator else None,
-                    "username": creator.username if creator else None,
-                    "first_name": creator.first_name if creator else None
-                } if creator else None,
-                "member_count": member_count,
                 "is_subscribed": is_subscribed,
-                "created_at": channel.created_at.isoformat()
+                "member_count": member_count,
+                "created_at": channel.created_at
             })
         
-        return {
-            "channels": result,
-            "page": page,
-            "limit": limit,
-            "total": db.query(Chat).filter(Chat.type == "channel").count()
-        }
+        return result
         
     except Exception as e:
-        logger.error(f"Get channels error: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to get channels: {str(e)}")
+        logger.error(f"Ошибка при получении каналов: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Внутренняя ошибка сервера"
+        )
 
-# WebSocket endpoint
+# ======================== WEBSOCKET ========================
+
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
-    """
-    WebSocket эндпоинт для живых сообщений
-    """
-    token = websocket.query_params.get("token")
-    if not token:
-        await websocket.close(code=1008, reason="Token required")
-        return
+    """WebSocket эндпоинт для реального времени"""
+    user = None
+    user_id = None
     
     try:
+        # Получение токена из параметров запроса
+        token = websocket.query_params.get("token")
+        if not token:
+            await websocket.close(code=1008, reason="Токен не предоставлен")
+            return
+        
         # Верификация токена
-        payload = verify_token(token)
-        user_id = int(payload.get("sub"))
+        try:
+            payload = verify_token(token)
+            user_id = int(payload.get("sub"))
+        except:
+            await websocket.close(code=1008, reason="Недействительный токен")
+            return
         
         # Получение пользователя из БД
         db = SessionLocal()
-        try:
-            user = db.query(User).filter(User.id == user_id).first()
-            if not user:
-                await websocket.close(code=1008, reason="User not found")
-                return
+        user = db.query(User).filter(User.id == user_id).first()
+        if not user:
+            await websocket.close(code=1008, reason="Пользователь не найден")
+            return
+        
+        # Проверка блокировок
+        if is_user_blocked(db, user_id, user_id):
+            await websocket.close(code=1008, reason="Вы заблокированы")
+            return
+        
+        # Подключение
+        await manager.connect(websocket, user_id)
+        
+        # Обновление статуса
+        user.is_online = True
+        user.last_seen = datetime.utcnow()
+        db.commit()
+        
+        # Уведомление о статусе
+        await send_online_status(user_id, True)
+        
+        logger.info(f"Пользователь {user.username} подключился к WebSocket")
+        
+        # Обработка сообщений
+        while True:
+            try:
+                data = await websocket.receive_json()
+                
+                # Обработка различных типов сообщений
+                msg_type = data.get("type")
+                
+                if msg_type == "message":
+                    # Отправка сообщения
+                    chat_id = data.get("chat_id")
+                    message_id = data.get("message_id")
+                    send_id = data.get("send_id")
+                    content = data.get("content")
+                    file_url = data.get("file_url")
+                    
+                    if not all([chat_id, message_id, send_id, content]):
+                        await websocket.send_json({
+                            "type": "error",
+                            "message": "Недостаточно данных для отправки сообщения"
+                        })
+                        continue
+                    
+                    # Проверка доступа
+                    member = db.query(ChatMember).filter(
+                        ChatMember.chat_id == chat_id,
+                        ChatMember.user_id == user_id
+                    ).first()
+                    
+                    if not member:
+                        await websocket.send_json({
+                            "type": "error",
+                            "message": "Нет доступа к чату"
+                        })
+                        continue
+                    
+                    # Проверка блокировки
+                    chat = db.query(Chat).filter(Chat.id == chat_id).first()
+                    if chat.type == "private":
+                        other_member = db.query(ChatMember).filter(
+                            ChatMember.chat_id == chat_id,
+                            ChatMember.user_id != user_id
+                        ).first()
+                        if other_member and is_user_blocked(db, user_id, other_member.user_id):
+                            await websocket.send_json({
+                                "type": "error",
+                                "message": "Вы заблокировали этого пользователя"
+                            })
+                            continue
+                    
+                    # Сохранение сообщения
+                    new_message = Message(
+                        message_id=message_id,
+                        send_id=send_id,
+                        chat_id=chat_id,
+                        sender_id=user_id,
+                        content=content,
+                        file_url=file_url
+                    )
+                    db.add(new_message)
+                    db.commit()
+                    db.refresh(new_message)
+                    
+                    # Подготовка ответа
+                    response = {
+                        "type": "message",
+                        "message_id": new_message.message_id,
+                        "send_id": new_message.send_id,
+                        "sender_id": new_message.sender_id,
+                        "chat_id": new_message.chat_id,
+                        "content": new_message.content,
+                        "file_url": new_message.file_url,
+                        "created_at": new_message.created_at.isoformat()
+                    }
+                    
+                    # Отправка всем участникам чата
+                    members = db.query(ChatMember).filter(ChatMember.chat_id == chat_id).all()
+                    for m in members:
+                        # Не отправляем отправителю
+                        if m.user_id != user_id:
+                            await manager.send_message(m.user_id, response)
+                    
+                    # Подтверждение доставки отправителю
+                    await websocket.send_json({
+                        "type": "delivered",
+                        "message_id": message_id,
+                        "send_id": send_id
+                    })
+                    
+                    logger.info(f"WebSocket сообщение {message_id} отправлено в чат {chat_id}")
+                
+                elif msg_type == "read":
+                    # Отметка прочитанного
+                    message_id = data.get("message_id")
+                    send_id = data.get("send_id")
+                    
+                    if not message_id or not send_id:
+                        await websocket.send_json({
+                            "type": "error",
+                            "message": "Недостаточно данных для отметки прочитанного"
+                        })
+                        continue
+                    
+                    message = db.query(Message).filter(
+                        Message.message_id == message_id,
+                        Message.send_id == send_id
+                    ).first()
+                    
+                    if message and message.sender_id != user_id:
+                        message.is_read = True
+                        message.read_at = datetime.utcnow()
+                        db.commit()
+                        
+                        # Отправка уведомления отправителю
+                        await manager.send_message(message.sender_id, {
+                            "type": "read",
+                            "message_id": message_id,
+                            "send_id": send_id
+                        })
+                        
+                        logger.info(f"Сообщение {message_id} отмечено как прочитанное через WebSocket")
+                
+                elif msg_type == "typing":
+                    # Индикатор набора текста
+                    chat_id = data.get("chat_id")
+                    is_typing = data.get("is_typing", False)
+                    
+                    if chat_id:
+                        members = db.query(ChatMember).filter(ChatMember.chat_id == chat_id).all()
+                        for m in members:
+                            if m.user_id != user_id:
+                                await manager.send_message(m.user_id, {
+                                    "type": "typing",
+                                    "chat_id": chat_id,
+                                    "user_id": user_id,
+                                    "is_typing": is_typing
+                                })
             
-            # Подключение WebSocket
-            await manager.connect(websocket, user_id)
-            
-            # Обновление статуса
-            user.is_online = True
+            except WebSocketDisconnect:
+                break
+            except Exception as e:
+                logger.error(f"Ошибка обработки WebSocket сообщения: {e}")
+                await websocket.send_json({
+                    "type": "error",
+                    "message": "Ошибка обработки сообщения"
+                })
+    
+    except WebSocketDisconnect:
+        pass
+    finally:
+        # Отключение
+        if user:
+            user.is_online = False
             user.last_seen = datetime.utcnow()
             db.commit()
             
-            # Трансляция статуса онлайн
-            await manager.broadcast_status(user_id, True)
+            # Уведомление о статусе
+            await send_online_status(user_id, False)
             
-            # Обработка сообщений
-            try:
-                while True:
-                    data = await websocket.receive_text()
-                    try:
-                        message_data = json.loads(data)
-                        msg_type = message_data.get("type")
-                        
-                        if msg_type == "message":
-                            # Обработка отправленного сообщения
-                            chat_id = message_data.get("chat_id")
-                            message_id = message_data.get("message_id")
-                            send_id = message_data.get("send_id")
-                            content = message_data.get("content")
-                            file_url = message_data.get("file_url")
-                            
-                            if not all([chat_id, message_id, send_id, content]):
-                                await websocket.send_json({
-                                    "type": "error",
-                                    "message": "Missing required fields"
-                                })
-                                continue
-                            
-                            # Проверка прав на отправку
-                            if not can_send_message(db, user_id, chat_id):
-                                await websocket.send_json({
-                                    "type": "error",
-                                    "message": "Cannot send message"
-                                })
-                                continue
-                            
-                            # Проверка уникальности message_id
-                            existing_message = db.query(Message).filter(
-                                Message.message_id == message_id
-                            ).first()
-                            
-                            if existing_message:
-                                await websocket.send_json({
-                                    "type": "error",
-                                    "message": "Message ID already exists"
-                                })
-                                continue
-                            
-                            # Создание сообщения в БД
-                            message = Message(
-                                message_id=message_id,
-                                send_id=send_id,
-                                chat_id=chat_id,
-                                sender_id=user_id,
-                                content=content,
-                                file_url=file_url
-                            )
-                            db.add(message)
-                            db.commit()
-                            db.refresh(message)
-                            
-                            # Отправка сообщения всем участникам чата
-                            members = db.query(ChatMember).filter(
-                                ChatMember.chat_id == chat_id
-                            ).all()
-                            
-                            ws_message = {
-                                "type": "message",
-                                "message_id": message.message_id,
-                                "send_id": message.send_id,
-                                "sender_id": message.sender_id,
-                                "chat_id": message.chat_id,
-                                "content": message.content,
-                                "file_url": message.file_url,
-                                "created_at": message.created_at.isoformat()
-                            }
-                            
-                            for member in members:
-                                if member.user_id != user_id:  # Не отправляем отправителю
-                                    # Проверка блокировки
-                                    if not is_user_blocked(db, member.user_id, user_id):
-                                        await manager.send_message(member.user_id, ws_message)
-                            
-                            # Подтверждение отправки отправителю
-                            await websocket.send_json({
-                                "type": "delivered",
-                                "message_id": message.message_id,
-                                "send_id": message.send_id
-                            })
-                            
-                        elif msg_type == "delivered":
-                            # Подтверждение доставки сообщения
-                            message_id = message_data.get("message_id")
-                            send_id = message_data.get("send_id")
-                            
-                            if not all([message_id, send_id]):
-                                await websocket.send_json({
-                                    "type": "error",
-                                    "message": "Missing fields"
-                                })
-                                continue
-                            
-                            # Обновление статуса доставки
-                            message = db.query(Message).filter(
-                                Message.message_id == message_id,
-                                Message.send_id == send_id
-                            ).first()
-                            
-                            if message:
-                                message.delivered_at = datetime.utcnow()
-                                db.commit()
-                                
-                                # Уведомление отправителя
-                                await manager.send_message(message.sender_id, {
-                                    "type": "delivered",
-                                    "message_id": message.message_id,
-                                    "send_id": message.send_id
-                                })
-                            
-                        elif msg_type == "read":
-                            # Подтверждение прочтения
-                            message_id = message_data.get("message_id")
-                            send_id = message_data.get("send_id")
-                            
-                            if not all([message_id, send_id]):
-                                await websocket.send_json({
-                                    "type": "error",
-                                    "message": "Missing fields"
-                                })
-                                continue
-                            
-                            # Обновление статуса прочтения
-                            message = db.query(Message).filter(
-                                Message.message_id == message_id,
-                                Message.send_id == send_id
-                            ).first()
-                            
-                            if message and message.sender_id != user_id:
-                                message.is_read = True
-                                message.read_at = datetime.utcnow()
-                                db.commit()
-                                
-                                # Уведомление отправителя
-                                await manager.send_message(message.sender_id, {
-                                    "type": "read",
-                                    "message_id": message.message_id,
-                                    "send_id": message.send_id
-                                })
-                        
-                        else:
-                            await websocket.send_json({
-                                "type": "error",
-                                "message": f"Unknown message type: {msg_type}"
-                            })
-                            
-                    except json.JSONDecodeError:
-                        await websocket.send_json({
-                            "type": "error",
-                            "message": "Invalid JSON"
-                        })
-                    except Exception as e:
-                        logger.error(f"WebSocket message processing error: {e}")
-                        await websocket.send_json({
-                            "type": "error",
-                            "message": f"Processing error: {str(e)}"
-                        })
-                        
-            except WebSocketDisconnect:
-                logger.info(f"WebSocket disconnected for user {user_id}")
-            except Exception as e:
-                logger.error(f"WebSocket error: {e}")
-            finally:
-                # Отключение пользователя
-                manager.disconnect(user_id)
-                
-                # Обновление статуса в БД
-                user.is_online = False
-                user.last_seen = datetime.utcnow()
-                db.commit()
-                
-                # Трансляция статуса офлайн
-                await manager.broadcast_status(user_id, False)
-                
-        finally:
+            logger.info(f"Пользователь {user.username} отключился от WebSocket")
+        
+        if user_id:
+            manager.disconnect(websocket)
+        
+        if 'db' in locals():
             db.close()
-            
-    except HTTPException as e:
-        await websocket.close(code=1008, reason=str(e.detail))
-    except Exception as e:
-        logger.error(f"WebSocket connection error: {e}")
-        await websocket.close(code=1011, reason="Internal server error")
 
-# Запуск приложения
+# ======================== ЗАПУСК ========================
+
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("server:app", host="0.0.0.0", port=8000, reload=True)
+    uvicorn.run(
+        "server:app",
+        host="0.0.0.0",
+        port=8000,
+        reload=True
+    )
