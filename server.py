@@ -257,8 +257,9 @@ class PasswordChange(BaseModel):
     old_password: str
     new_password: str = Field(..., min_length=8)
 
+# ИСПРАВЛЕНО: regex -> pattern
 class ChatCreate(BaseModel):
-    type: str = Field(..., regex="^(private|group|channel)$")
+    type: str = Field(..., pattern="^(private|group|channel)$")
     name: Optional[str] = Field(None, max_length=100)
     description: Optional[str] = Field(None, max_length=500)
     members: Optional[List[int]] = []  # IDs пользователей для добавления
